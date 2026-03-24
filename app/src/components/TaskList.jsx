@@ -898,6 +898,7 @@ export default forwardRef(function TaskList(props, ref) {
             <motion.div
               animate={{ scale: [1, 1.3, 1], opacity: [0.5, 1, 0.5] }}
               transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
+              style={{ willChange: 'transform' }}
             >
               <RuneIcon size="4rem" />
             </motion.div>
