@@ -1,0 +1,12 @@
+name: stuf-sync-server
+
+on:
+  push:
+    tags:
+      - "production-*.*.*"
+      - "sync-*.*.*"
+
+jobs:
+  build-and-deploy:
+    uses: asbjornenge/forgejo-ci/.forgejo/workflows/stuf-sync-server.yml@main
+    secrets: inherit

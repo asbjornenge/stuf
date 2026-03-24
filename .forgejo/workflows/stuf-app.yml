@@ -1,0 +1,12 @@
+name: stuf-app
+
+on:
+  push:
+    tags:
+      - "production-*.*.*"
+      - "app-*.*.*"
+
+jobs:
+  build-and-deploy:
+    uses: asbjornenge/forgejo-ci/.forgejo/workflows/stuf-app.yml@main
+    secrets: inherit

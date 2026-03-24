@@ -1,0 +1,40 @@
+{
+  "name": "todo-sync",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@sentry/browser": "^5.30.0",
+    "automerge": "^0.14.2",
+    "crypto-js": "^4.2.0",
+    "framer-motion": "^12.36.0",
+    "html5-qrcode": "^2.3.8",
+    "idb": "^8.0.1",
+    "lucide-react": "^0.577.0",
+    "marked": "^17.0.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-qr-code": "^2.0.15",
+    "simple-peer": "^9.11.1",
+    "styled-components": "^6.1.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.15.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.15.0",
+    "eslint-plugin-react": "^7.37.2",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.14",
+    "globals": "^15.12.0",
+    "rollup-plugin-node-polyfills": "^0.2.1",
+    "vite": "^6.0.1"
+  }
+}

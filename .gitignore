@@ -1,0 +1,7 @@
+node_modules/
+dist/
+/screenshots/
+.env
+.env.*
+!.env.example
+*.local

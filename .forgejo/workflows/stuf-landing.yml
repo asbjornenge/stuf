@@ -1,0 +1,12 @@
+name: stuf-landing
+
+on:
+  push:
+    tags:
+      - "production-*.*.*"
+      - "landing-*.*.*"
+
+jobs:
+  build-and-deploy:
+    uses: asbjornenge/forgejo-ci/.forgejo/workflows/stuf-landing.yml@main
+    secrets: inherit
