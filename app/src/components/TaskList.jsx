@@ -900,7 +900,7 @@ export default forwardRef(function TaskList(props, ref) {
               transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
               style={{ willChange: 'transform' }}
             >
-              <RuneIcon size="4rem" />
+              <div><RuneIcon size="4rem" /></div>
             </motion.div>
           </LoadingScreen>
         )}
