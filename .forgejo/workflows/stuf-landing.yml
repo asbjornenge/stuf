@@ -8,5 +8,6 @@ on:
 
 jobs:
   build-and-deploy:
+    runs-on: docker
     uses: asbjornenge/forgejo-ci/.forgejo/workflows/stuf-landing.yml@main
     secrets: inherit

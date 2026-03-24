@@ -8,5 +8,6 @@ on:
 
 jobs:
   build-and-deploy:
+    runs-on: docker
     uses: asbjornenge/forgejo-ci/.forgejo/workflows/stuf-sync-server.yml@main
     secrets: inherit
