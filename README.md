@@ -9,7 +9,7 @@ Open-source, offline-first to-do app with encrypted sync.
 | Package | Description |
 |---|---|
 | [`app/`](./app) | React + Vite frontend |
-| [`sync-server/`](./sync-server) | Node.js sync backend |
+| [`sync/`](./sync) | Node.js sync backend |
 | [`landing/`](./landing) | Marketing/landing page |
 
 ---
@@ -27,7 +27,7 @@ docker compose up
 | Service | URL |
 |---|---|
 | app | http://localhost:5173 |
-| sync-server | http://localhost:3000 |
+| sync | http://localhost:3000 |
 | landing | http://localhost:5174 |
 
 ---
@@ -44,7 +44,7 @@ React + Vite frontend.
 
 ---
 
-## sync-server
+## sync
 
 Node.js/Express backend with PostgreSQL.
 

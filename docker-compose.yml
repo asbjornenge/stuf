@@ -13,7 +13,7 @@ services:
       timeout: 5s
       retries: 10
 
-  sync-server:
+  sync:
     image: node:22.5.0-alpine
     working_dir: /app
     command: sh -c "npm install && node --watch index.js"
@@ -28,7 +28,7 @@ services:
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
     volumes:
-      - ./sync-server:/app
+      - ./sync:/app
     depends_on:
       db:
         condition: service_healthy
@@ -44,7 +44,7 @@ services:
     volumes:
       - ./app:/app
     depends_on:
-      - sync-server
+      - sync
 
   landing:
     image: node:22.5.0-alpine
