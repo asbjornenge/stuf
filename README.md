@@ -52,6 +52,13 @@ Node.js/Express backend with PostgreSQL.
 |---|---|
 | `npm start` | Start server |
 
+**Modes** (set via `MODE` in `.env`):
+
+| Mode | Description |
+|---|---|
+| `standalone` | Single space, single user — default for self-hosting |
+| `multi` | Multiple spaces — set `PAYMENTS_ENABLED=true` to require Stripe payment per space |
+
 ---
 
 ## landing
