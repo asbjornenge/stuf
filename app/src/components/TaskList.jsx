@@ -895,13 +895,9 @@ export default forwardRef(function TaskList(props, ref) {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.4, ease: 'easeOut' }}
           >
-            <motion.div
-              animate={{ scale: [1, 1.3, 1], opacity: [0.5, 1, 0.5] }}
-              transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
-              style={{ willChange: 'transform' }}
-            >
-              <div><RuneIcon size="4rem" /></div>
-            </motion.div>
+            <div className="loader-pulse">
+              <RuneIcon size="4rem" />
+            </div>
           </LoadingScreen>
         )}
       </AnimatePresence>
@@ -934,6 +930,15 @@ const LoadingScreen = styled(motion.div)`
   align-items: center;
   justify-content: center;
   z-index: 10000;
+
+  .loader-pulse {
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { transform: scale(1); opacity: 0.5; }
+    50% { transform: scale(1.3); opacity: 1; }
+  }
 `;
 
 const Page = styled(motion.div)`
