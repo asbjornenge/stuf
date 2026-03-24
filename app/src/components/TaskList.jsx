@@ -891,12 +891,12 @@ export default forwardRef(function TaskList(props, ref) {
         {!appReady && (
           <LoadingScreen
             key="loading"
-            initial={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.4, ease: 'easeOut' }}
+            initial={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 1.3 }}
+            transition={{ duration: 0.5, ease: 'easeOut' }}
           >
             <div className="loader-pulse">
-              <RuneIcon size="4rem" />
+              <RuneIcon size="5rem" />
             </div>
           </LoadingScreen>
         )}
@@ -933,11 +933,12 @@ const LoadingScreen = styled(motion.div)`
 
   .loader-pulse {
     animation: pulse 1.4s ease-in-out infinite;
+    margin-top: -4rem;
   }
 
   @keyframes pulse {
-    0%, 100% { transform: scale(1); opacity: 0.5; }
-    50% { transform: scale(1.3); opacity: 1; }
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
   }
 `;
 
