@@ -251,7 +251,7 @@ export default forwardRef(function TaskList(props, ref) {
 
   useEffect(() => {
     const initialize = async () => {
-      const MIN_LOADING_MS = 700;
+      const MIN_LOADING_MS = 2000;
       const startTime = Date.now();
       await initCRDT();
       refreshFromDoc();
