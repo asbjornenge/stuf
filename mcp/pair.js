@@ -72,8 +72,11 @@ const html = `<!DOCTYPE html>
 </body>
 </html>`;
 
-export async function startPairingServer() {
+export function startPairingServer() {
   return new Promise((resolve, reject) => {
+    let onPaired;
+    const paired = new Promise(r => { onPaired = r; });
+
     const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -115,7 +118,7 @@ export async function startPairingServer() {
 
             setTimeout(() => {
               server.close();
-              resolve(config);
+              onPaired(config);
             }, 1000);
           } catch (err) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -132,8 +135,8 @@ export async function startPairingServer() {
     server.listen(0, () => {
       const port = server.address().port;
       const url = `http://localhost:${port}`;
-      console.log(`Pairing server running at ${url}`);
       openBrowser(url);
+      resolve({ url, paired });
     });
 
     server.on('error', reject);
