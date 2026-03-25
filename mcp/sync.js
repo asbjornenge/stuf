@@ -14,6 +14,9 @@ export function configure(url, token) {
   deviceToken = token;
 }
 
+export function getServerUrl() { return serverUrl; }
+export function getDeviceToken() { return deviceToken; }
+
 export function getDoc() {
   return doc;
 }

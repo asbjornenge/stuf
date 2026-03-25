@@ -4,7 +4,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { configure, initialize, getDoc, applyAndPush, connectWebSocket } from './sync.js';
+import { configure, initialize, getDoc, applyAndPush, connectWebSocket, getServerUrl, getDeviceToken } from './sync.js';
 import { setEncryptionKey } from './crypto.js';
 import { startPairingServer } from './pair.js';
 
@@ -66,7 +66,7 @@ function requireSync() {
 }
 
 server.tool('list_tasks', 'List all tasks, optionally filtered by status or tag', {
-  status: z.enum(['all', 'active', 'done']).optional().default('all').describe('Filter by status'),
+  status: z.enum(['all', 'active', 'done']).optional().default('active').describe('Filter by status'),
   tag: z.string().optional().describe('Filter by tag'),
   project: z.string().optional().describe('Filter by project name')
 }, async ({ status, tag, project }) => {
@@ -74,7 +74,7 @@ server.tool('list_tasks', 'List all tasks, optionally filtered by status or tag'
   const doc = getDoc();
   let tasks = doc.todos || [];
 
-  if (status === 'active') tasks = tasks.filter(t => !t.completed);
+  if (status === 'active') tasks = tasks.filter(t => !t.completed && !(t.snoozeUntil && t.snoozeUntil > Date.now()));
   if (status === 'done') tasks = tasks.filter(t => t.completed);
   if (tag) tasks = tasks.filter(t => t.tags && t.tags.includes(tag));
   if (project) {
@@ -303,6 +303,17 @@ server.tool('set_reminder', 'Set a reminder for a task at a specific date/time',
     }
   });
 
+  // Register with server for push notification
+  try {
+    await fetch(`${getServerUrl()}/api/push/reminder`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getDeviceToken()}` },
+      body: JSON.stringify({ taskId: String(task.id), title: task.name, notifyAt: reminder })
+    });
+  } catch (err) {
+    // Push registration failed, but CRDT reminder is set
+  }
+
   return { content: [{ type: 'text', text: `Reminder set for "${task.name}" at ${new Date(reminder).toLocaleString()}` }] };
 });
 
@@ -335,6 +346,136 @@ server.tool('delete_tag', 'Delete a global tag', {
   });
 
   return { content: [{ type: 'text', text: `Deleted tag: ${name}` }] };
+});
+
+server.tool('unsnooze_task', 'Remove snooze from a task', {
+  search: z.string().describe('Task text (partial match)')
+}, async ({ search }) => {
+  requireSync();
+  const doc = getDoc();
+  const task = (doc.todos || []).find(t => t.name.toLowerCase().includes(search.toLowerCase()));
+  if (!task) return { content: [{ type: 'text', text: `No task matching "${search}" found.` }] };
+
+  await applyAndPush(d => {
+    const t = d.todos.find(t => t.id === task.id);
+    if (t) {
+      delete t.snoozeUntil;
+      t.updated = Date.now();
+    }
+  });
+
+  return { content: [{ type: 'text', text: `Unsnooze: ${task.name}` }] };
+});
+
+server.tool('clear_reminder', 'Remove reminder from a task', {
+  search: z.string().describe('Task text (partial match)')
+}, async ({ search }) => {
+  requireSync();
+  const doc = getDoc();
+  const task = (doc.todos || []).find(t => t.name.toLowerCase().includes(search.toLowerCase()));
+  if (!task) return { content: [{ type: 'text', text: `No task matching "${search}" found.` }] };
+
+  await applyAndPush(d => {
+    const t = d.todos.find(t => t.id === task.id);
+    if (t) {
+      delete t.reminder;
+      t.updated = Date.now();
+    }
+  });
+
+  // Cancel on server
+  try {
+    await fetch(`${getServerUrl()}/api/push/reminder`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getDeviceToken()}` },
+      body: JSON.stringify({ taskId: String(task.id) })
+    });
+  } catch (err) {
+    // Cancel failed, but CRDT reminder is cleared
+  }
+
+  return { content: [{ type: 'text', text: `Reminder cleared: ${task.name}` }] };
+});
+
+server.tool('add_project', 'Create a new project', {
+  name: z.string().describe('Project name')
+}, async ({ name }) => {
+  requireSync();
+  const doc = getDoc();
+  const exists = (doc.projects || []).find(p => p.name === name);
+  if (exists) return { content: [{ type: 'text', text: `Project "${name}" already exists.` }] };
+
+  await applyAndPush(d => {
+    if (!d.projects) d.projects = [];
+    d.projects.push({ id: Date.now(), name });
+  });
+
+  return { content: [{ type: 'text', text: `Created project: ${name}` }] };
+});
+
+server.tool('delete_project', 'Delete a project', {
+  name: z.string().describe('Project name')
+}, async ({ name }) => {
+  requireSync();
+  const doc = getDoc();
+  const idx = (doc.projects || []).findIndex(p => p.name === name);
+  if (idx === -1) return { content: [{ type: 'text', text: `Project "${name}" not found.` }] };
+
+  await applyAndPush(d => {
+    if (d.projects) d.projects.splice(idx, 1);
+  });
+
+  return { content: [{ type: 'text', text: `Deleted project: ${name}` }] };
+});
+
+server.tool('move_to_project', 'Move a task to a project (or out of a project)', {
+  search: z.string().describe('Task text (partial match)'),
+  project: z.string().optional().describe('Project name (omit to remove from project)')
+}, async ({ search, project }) => {
+  requireSync();
+  const doc = getDoc();
+  const task = (doc.todos || []).find(t => t.name.toLowerCase().includes(search.toLowerCase()));
+  if (!task) return { content: [{ type: 'text', text: `No task matching "${search}" found.` }] };
+
+  let projectId = null;
+  if (project) {
+    const proj = (doc.projects || []).find(p => p.name === project);
+    if (!proj) return { content: [{ type: 'text', text: `Project "${project}" not found. Create it first with add_project.` }] };
+    projectId = proj.id;
+  }
+
+  await applyAndPush(d => {
+    const t = d.todos.find(t => t.id === task.id);
+    if (t) {
+      if (projectId) {
+        t.projectId = projectId;
+      } else {
+        delete t.projectId;
+      }
+      t.updated = Date.now();
+    }
+  });
+
+  return { content: [{ type: 'text', text: project ? `Moved "${task.name}" to project "${project}"` : `Removed "${task.name}" from project` }] };
+});
+
+server.tool('upcoming', 'Show upcoming tasks (snoozed tasks with future dates)', {}, async () => {
+  requireSync();
+  const doc = getDoc();
+  const now = Date.now();
+  const tasks = (doc.todos || [])
+    .filter(t => !t.completed && t.snoozeUntil && t.snoozeUntil > now)
+    .sort((a, b) => a.snoozeUntil - b.snoozeUntil);
+
+  if (tasks.length === 0) return { content: [{ type: 'text', text: 'No upcoming snoozed tasks.' }] };
+
+  const formatted = tasks.map(t => {
+    const date = new Date(t.snoozeUntil).toLocaleDateString();
+    const reminder = t.reminder ? ` 🔔 ${new Date(t.reminder).toLocaleString()}` : '';
+    return `○ ${t.name} — snoozed until ${date}${reminder}`;
+  }).join('\n');
+
+  return { content: [{ type: 'text', text: formatted }] };
 });
 
 server.tool('list_projects', 'List all projects', {}, async () => {
