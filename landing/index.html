@@ -14,6 +14,7 @@
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <title>stꝋf — Your stuff, organized</title>
     <link rel="stylesheet" href="/src/style.css" />
+    <script src="https://unpkg.com/lucide@latest"></script>
   </head>
   <body>
     <nav class="nav">
@@ -152,19 +153,47 @@ docker compose up -d</code>
         </div>
         <div class="self-host-cards">
           <div class="self-host-card">
-            <div class="self-host-card-icon">🐳</div>
+            <div class="self-host-card-icon"><i data-lucide="container"></i></div>
             <h4>Docker ready</h4>
             <p>Single command deploy with Docker Compose. PostgreSQL included.</p>
           </div>
           <div class="self-host-card">
-            <div class="self-host-card-icon">🔐</div>
+            <div class="self-host-card-icon"><i data-lucide="lock-keyhole"></i></div>
             <h4>Zero knowledge</h4>
             <p>The server never sees your data. All encryption happens client-side.</p>
           </div>
           <div class="self-host-card">
-            <div class="self-host-card-icon">📱</div>
+            <div class="self-host-card-icon"><i data-lucide="qr-code"></i></div>
             <h4>QR pairing</h4>
             <p>Scan a QR code to connect devices. No accounts or passwords.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="ai-ready">
+      <div class="ai-ready-inner">
+        <h2><span class="gradient-text">AI</span> ready</h2>
+        <p>Let your AI assistant manage your tasks. stuf ships with an MCP server that connects to Claude and other AI tools.</p>
+        <div class="code-block">
+          <code><span class="code-comment"># Add to Claude Code</span>
+claude mcp add stuf -- npx stuf-mcp</code>
+        </div>
+        <div class="self-host-cards">
+          <div class="self-host-card">
+            <div class="self-host-card-icon"><i data-lucide="bot"></i></div>
+            <h4>MCP powered</h4>
+            <p>Works with Claude Code and any MCP-compatible AI assistant.</p>
+          </div>
+          <div class="self-host-card">
+            <div class="self-host-card-icon"><i data-lucide="refresh-cw"></i></div>
+            <h4>Full sync</h4>
+            <p>AI changes sync instantly to all your devices via encrypted sync.</p>
+          </div>
+          <div class="self-host-card">
+            <div class="self-host-card-icon"><i data-lucide="list-checks"></i></div>
+            <h4>Everything you need</h4>
+            <p>Tasks, checklists, notes, tags, projects, reminders — all from your AI.</p>
           </div>
         </div>
       </div>
@@ -189,5 +218,6 @@ docker compose up -d</code>
         </div>
       </div>
     </footer>
+    <script>lucide.createIcons();</script>
   </body>
 </html>

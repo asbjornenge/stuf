@@ -11,6 +11,7 @@ Open-source, offline-first to-do app with encrypted sync.
 | [`app/`](./app) | React + Vite frontend |
 | [`sync/`](./sync) | Node.js sync backend |
 | [`landing/`](./landing) | Marketing/landing page |
+| [`mcp/`](./mcp) | MCP server for AI integration |
 
 ---
 
@@ -69,3 +70,26 @@ Static marketing site built with Vite.
 |---|---|
 | `npm run dev` | Start dev server |
 | `npm run build` | Production build |
+
+---
+
+## AI / MCP
+
+stuf is AI-ready via [MCP](https://modelcontextprotocol.io). Let your AI assistant manage tasks, set reminders, and organize projects — synced to all your devices.
+
+### Quick setup
+
+```bash
+claude mcp add stuf -- npx stuf-mcp
+```
+
+Then call the `pair` tool to connect via QR code from the stuf app.
+
+### What it can do
+
+- Add, update, complete, and delete tasks
+- Manage checklists, notes, tags, and projects
+- Snooze tasks and set push notification reminders
+- Reorder and organize your task list
+
+See [`mcp/README.md`](./mcp/README.md) for full documentation.
