@@ -117,6 +117,13 @@ server.tool('add_task', 'Add a new task', {
   const maxOrder = (doc.todos || []).reduce((max, t) => Math.max(max, t.order || 0), 0);
 
   await applyAndPush(d => {
+    // Auto-create missing tags
+    if (tags?.length) {
+      if (!d.tags) d.tags = [];
+      for (const tag of tags) {
+        if (!d.tags.find(t => t === tag)) d.tags.push(tag);
+      }
+    }
     if (!d.todos) d.todos = [];
     const task = { id: now, name: text, completed: false, created: now, updated: now, order: maxOrder + 1 };
     if (notes) task.notes = notes;
@@ -177,6 +184,13 @@ server.tool('update_task', 'Update a task', {
 
   const now = Date.now();
   await applyAndPush(d => {
+    // Auto-create missing tags
+    if (tags?.length) {
+      if (!d.tags) d.tags = [];
+      for (const tag of tags) {
+        if (!d.tags.find(t => t === tag)) d.tags.push(tag);
+      }
+    }
     const t = d.todos.find(t => t.id === task.id);
     if (t) {
       if (text) t.name = text;
