@@ -1,0 +1,39 @@
+{
+  "name": "stuf-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server for stuf — AI-powered task management",
+  "main": "index.js",
+  "bin": {
+    "stuf-mcp": "index.js"
+  },
+  "files": [
+    "index.js",
+    "sync.js",
+    "crypto.js",
+    "pair.js",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "stuf",
+    "tasks",
+    "todo",
+    "ai",
+    "claude"
+  ],
+  "author": "asbjornenge",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asbjornenge/stuf"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "automerge": "^0.14.2",
+    "ws": "^8.18.0"
+  }
+}

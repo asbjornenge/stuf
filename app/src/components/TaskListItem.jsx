@@ -188,7 +188,8 @@ function TaskListItem({
       const { id, url } = await shareNotes(notesInput, task.shareId);
       if (!task.shareId) onSave({ ...task, shareId: id });
       setLastSharedContent(notesInput);
-      if (navigator.share) {
+      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      if (isMobile && navigator.share) {
         await navigator.share({ url });
       } else {
         await navigator.clipboard.writeText(url);
