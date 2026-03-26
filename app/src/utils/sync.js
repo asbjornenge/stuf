@@ -327,6 +327,22 @@ export async function pullSnapshot() {
   saveLastSeq(result.seq);
 }
 
+// --- Periodic snapshot push (max once per 24h) ---
+
+const SNAPSHOT_MIN_INTERVAL = 24 * 60 * 60 * 1000;
+const SNAPSHOT_TS_KEY = 'stuf-last-snapshot-push';
+
+async function maybePushSnapshot() {
+  const unpushed = await getUnpushedChanges();
+  if (unpushed.length > 0) return;
+
+  const lastPush = parseInt(localStorage.getItem(SNAPSHOT_TS_KEY)) || 0;
+  if (Date.now() - lastPush < SNAPSHOT_MIN_INTERVAL) return;
+
+  await pushSnapshot();
+  localStorage.setItem(SNAPSHOT_TS_KEY, String(Date.now()));
+}
+
 // --- Push unpushed local changes ---
 
 export async function pushAllLocalChanges() {
@@ -454,6 +470,7 @@ export async function initSync(onRemoteChanges, onSyncError) {
   try {
     await pushAllLocalChanges();
     await pullChanges();
+    await maybePushSnapshot();
   } catch (err) {
     reportSyncError('initial-sync', err);
   }
