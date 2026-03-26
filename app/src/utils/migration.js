@@ -46,11 +46,25 @@ async function deleteOldDb() {
   });
 }
 
+// Yield to event loop so UI can update
+function yieldToUI() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
 // Replay old changes with legacy Automerge and extract plain state
 async function replayWithLegacy(changes) {
   const OldAutomerge = await import('automerge-legacy');
   let oldDoc = OldAutomerge.default.init();
-  oldDoc = OldAutomerge.default.applyChanges(oldDoc, changes);
+
+  // Batch apply to avoid blocking main thread
+  const BATCH_SIZE = 100;
+  for (let i = 0; i < changes.length; i += BATCH_SIZE) {
+    const batch = changes.slice(i, i + BATCH_SIZE);
+    oldDoc = OldAutomerge.default.applyChanges(oldDoc, batch);
+    console.log(`Migration: ${Math.min(i + BATCH_SIZE, changes.length)}/${changes.length} changes`);
+    await yieldToUI();
+  }
+
   return JSON.parse(JSON.stringify(oldDoc));
 }
 
