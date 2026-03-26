@@ -58,6 +58,7 @@ export function resetLastSeq() {
 
 export async function forceResync() {
   if (!getSyncConfig()) return;
+  await pushAllLocalChanges();
   resetLastSeq();
   await pullChanges();
 }
