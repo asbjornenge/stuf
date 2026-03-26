@@ -11,6 +11,7 @@ import {
   setSpaceSubscription, setSubscriptionStatus,
   upsertSharedNote, getSharedNote,
 } from './db.js';
+import { BODY_LIMIT } from './config.js';
 import { setupWebSocket } from './ws.js';
 import pairRoutes from './routes/pair.js';
 import changesRoutes from './routes/changes.js';
@@ -41,7 +42,7 @@ async function main() {
   // Stripe webhook needs raw body — must be before express.json()
   app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }), webhookRoutes);
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: BODY_LIMIT }));
 
   // CORS
   app.use((req, res, next) => {

@@ -331,7 +331,7 @@ export async function pushAllLocalChanges() {
   const allChanges = getLocalChanges();
   if (allChanges.length === 0) return;
 
-  const BATCH_SIZE = 50;
+  const BATCH_SIZE = 500;
   for (let i = 0; i < allChanges.length; i += BATCH_SIZE) {
     const batch = allChanges.slice(i, i + BATCH_SIZE);
     const encrypted = await Promise.all(

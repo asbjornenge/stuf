@@ -10,3 +10,4 @@ export const PAYMENTS_ENABLED = config('PAYMENTS_ENABLED', 'false') === 'true';
 export const STRIPE_SECRET_KEY = config('STRIPE_SECRET_KEY', '');
 export const STRIPE_PRICE_ID = config('STRIPE_PRICE_ID', '');
 export const STRIPE_WEBHOOK_SECRET = config('STRIPE_WEBHOOK_SECRET', '');
+export const BODY_LIMIT = config('BODY_LIMIT', '50mb');
