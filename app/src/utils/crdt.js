@@ -1,6 +1,8 @@
 import * as Automerge from '@automerge/automerge';
 import { openDB } from 'idb';
-import { migrateFromV1, createDocFromState } from './migration.js';
+import { migrateFromV1, needsMigration, createDocFromState } from './migration.js';
+
+export { needsMigration };
 
 let doc = null;
 
@@ -97,7 +99,7 @@ export const loadDocumentSnapshot = async (data) => {
 
 // --- Init with migration support ---
 
-export const initCRDT = async () => {
+export const initCRDT = async (onMigrationProgress) => {
   const db = await dbPromise;
 
   // Fast path: load existing 3.x snapshot
@@ -114,7 +116,7 @@ export const initCRDT = async () => {
   }
 
   // Migration path: check for old crdtDB
-  const migratedDoc = await migrateFromV1();
+  const migratedDoc = await migrateFromV1(onMigrationProgress);
   if (migratedDoc) {
     doc = migratedDoc;
     await saveSnapshot();

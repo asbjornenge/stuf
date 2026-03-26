@@ -52,18 +52,28 @@ function yieldToUI() {
 }
 
 // Replay old changes with legacy Automerge and extract plain state
-async function replayWithLegacy(changes) {
+async function replayWithLegacy(changes, onProgress) {
+  onProgress?.({ step: 'replay', message: 'Loading legacy Automerge...', progress: 0 });
+  await yieldToUI();
+
   const OldAutomerge = await import('automerge-legacy');
   let oldDoc = OldAutomerge.default.init();
 
-  // Batch apply to avoid blocking main thread
+  onProgress?.({ step: 'replay', message: `Replaying ${changes.length} changes...`, progress: 0 });
+  await yieldToUI();
+
   const BATCH_SIZE = 100;
   for (let i = 0; i < changes.length; i += BATCH_SIZE) {
     const batch = changes.slice(i, i + BATCH_SIZE);
     oldDoc = OldAutomerge.default.applyChanges(oldDoc, batch);
-    console.log(`Migration: ${Math.min(i + BATCH_SIZE, changes.length)}/${changes.length} changes`);
+    const done = Math.min(i + BATCH_SIZE, changes.length);
+    const progress = done / changes.length;
+    onProgress?.({ step: 'replay', message: `Replaying changes: ${done}/${changes.length}`, progress });
     await yieldToUI();
   }
+
+  onProgress?.({ step: 'convert', message: 'Extracting document state...', progress: 1 });
+  await yieldToUI();
 
   return JSON.parse(JSON.stringify(oldDoc));
 }
@@ -108,22 +118,46 @@ export function createDocFromState(state) {
   });
 }
 
+// Check if migration is needed (without running it)
+export async function needsMigration() {
+  return oldDbExists();
+}
+
 // Main migration function — returns Automerge 3.x doc or null
-export async function migrateFromV1() {
+export async function migrateFromV1(onProgress) {
+  onProgress?.({ step: 'check', message: 'Checking for existing data...', progress: 0 });
+  await yieldToUI();
+
   const exists = await oldDbExists();
   if (!exists) return null;
 
+  onProgress?.({ step: 'load', message: 'Loading existing changes from database...', progress: 0 });
+  await yieldToUI();
+
   const changes = await loadOldChanges();
+  onProgress?.({ step: 'load', message: `Loaded ${changes.length} changes`, progress: 0 });
+  await yieldToUI();
+
   if (changes.length === 0) {
     await deleteOldDb();
     return null;
   }
 
-  const plainState = await replayWithLegacy(changes);
+  const plainState = await replayWithLegacy(changes, onProgress);
+
+  onProgress?.({ step: 'create', message: 'Creating new document format...', progress: 1 });
+  await yieldToUI();
+
   const newDoc = createDocFromState(plainState);
+
+  onProgress?.({ step: 'cleanup', message: 'Cleaning up old database...', progress: 1 });
+  await yieldToUI();
 
   await deleteOldDb();
   localStorage.setItem('stuf-needs-migration-push', 'true');
+
+  onProgress?.({ step: 'done', message: 'Migration complete!', progress: 1 });
+  await yieldToUI();
 
   return newDoc;
 }

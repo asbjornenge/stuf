@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback, useImperativeHandle, forwardRef } from 'react';
 import styled from 'styled-components';
 import { AnimatePresence, motion } from 'framer-motion';
-import { initCRDT, getDocument, addTask, updateTask, deleteTask, updateTaskOrder, getGlobalTags, addGlobalTag, deleteGlobalTag, getRecentTags, updateRecentTags, getProjects, addProject, deleteProject, getSettings, updateSettings } from '../utils/crdt';
+import { initCRDT, needsMigration, getDocument, addTask, updateTask, deleteTask, updateTaskOrder, getGlobalTags, addGlobalTag, deleteGlobalTag, getRecentTags, updateRecentTags, getProjects, addProject, deleteProject, getSettings, updateSettings } from '../utils/crdt';
 import { initSync, teardownSync, isSyncing } from '../utils/sync';
 import { registerReminder, cancelReminder, subscribeToPush } from '../utils/push';
 import { toPlainTask } from '../utils/task';
@@ -249,11 +249,38 @@ export default forwardRef(function TaskList(props, ref) {
     showToast(`Sync failed: ${message}`, 'error', 6000);
   }, [showToast]);
 
+  const [migrating, setMigrating] = useState(false);
+  const [migrationProgress, setMigrationProgress] = useState(0);
+  const [migrationLogs, setMigrationLogs] = useState([]);
+
+  const addMigrationLog = useCallback((msg) => {
+    setMigrationLogs(prev => [...prev, msg]);
+  }, []);
+
   useEffect(() => {
     const initialize = async () => {
+      // Check if migration is needed — show migration UI
+      const needsMig = await needsMigration();
+      if (needsMig) {
+        setMigrating(true);
+        addMigrationLog('Starting migration...');
+      }
+
       const MIN_LOADING_MS = 2000;
       const startTime = Date.now();
-      await initCRDT();
+
+      try {
+        await initCRDT((update) => {
+          setMigrationProgress(update.progress);
+          addMigrationLog(update.message);
+        });
+      } catch (err) {
+        addMigrationLog(`ERROR: ${err.message}`);
+        console.error('initCRDT failed:', err);
+        return;
+      }
+
+      setMigrating(false);
       refreshFromDoc();
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, MIN_LOADING_MS - elapsed);
@@ -895,9 +922,24 @@ export default forwardRef(function TaskList(props, ref) {
             exit={{ opacity: 0, scale: 1.3 }}
             transition={{ duration: 0.5, ease: 'easeOut' }}
           >
-            <div className="loader-pulse">
-              <RuneIcon size="5rem" />
-            </div>
+            {migrating ? (
+              <MigrationContainer>
+                <RuneIcon size="4rem" />
+                <MigrationTitle>Migrating to v{__APP_VERSION__}</MigrationTitle>
+                <MigrationProgressBar>
+                  <MigrationProgressFill style={{ width: `${migrationProgress * 100}%` }} />
+                </MigrationProgressBar>
+                <MigrationLog>
+                  {migrationLogs.map((log, i) => (
+                    <div key={i}>{log}</div>
+                  ))}
+                </MigrationLog>
+              </MigrationContainer>
+            ) : (
+              <div className="loader-pulse">
+                <RuneIcon size="5rem" />
+              </div>
+            )}
           </LoadingScreen>
         )}
       </AnimatePresence>
@@ -939,6 +981,55 @@ const LoadingScreen = styled(motion.div)`
   @keyframes pulse {
     0%, 100% { opacity: 0.5; }
     50% { opacity: 1; }
+  }
+`;
+
+const MigrationContainer = styled.div`
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 2rem;
+  max-width: 24rem;
+  width: 100%;
+  margin-top: -4rem;
+`;
+
+const MigrationTitle = styled.div`
+  font-size: 1rem;
+  color: #999;
+  font-weight: 500;
+`;
+
+const MigrationProgressBar = styled.div`
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  overflow: hidden;
+`;
+
+const MigrationProgressFill = styled.div`
+  height: 100%;
+  background: linear-gradient(90deg, #E85D24, #F5C030);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+`;
+
+const MigrationLog = styled.div`
+  width: 100%;
+  max-height: 8rem;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.7rem;
+  color: #666;
+  line-height: 1.6;
+  padding: 0.75rem;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 0.5rem;
+
+  div:last-child {
+    color: #999;
   }
 `;
 
