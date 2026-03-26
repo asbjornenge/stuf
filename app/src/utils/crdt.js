@@ -2,7 +2,7 @@ import * as Automerge from '@automerge/automerge';
 import { openDB } from 'idb';
 import { migrateFromV1, createDocFromState } from './migration.js';
 
-let doc = Automerge.init();
+let doc = null;
 
 // Hook for sync — called with each new local change (Uint8Array)
 let _onLocalChange = null;
