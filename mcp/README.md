@@ -78,4 +78,4 @@ You can also configure via environment variables (skips pairing):
 
 ## License
 
-MIT
+AGPL-3.0
