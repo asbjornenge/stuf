@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { storeChanges, getChangesSince, getLastSeq, findDevice, getSpace, storeSnapshot, getSnapshot } from '../db.js';
+import { storeChanges, getChangesSince, getLastSeq, findDevice, getSpace, storeSnapshot, getSnapshot, getConfig, setConfig } from '../db.js';
 import { notifyClients } from '../ws.js';
 
 const router = Router();
@@ -25,11 +25,17 @@ router.use(requireDevice);
 
 // Push encrypted changes
 router.post('/', async (req, res) => {
-  const { changes } = req.body;
+  const { changes, formatVersion } = req.body;
   const spaceId = req.device.space_id;
 
   if (!Array.isArray(changes) || changes.length === 0) {
     return res.status(400).json({ error: 'Missing or empty changes array' });
+  }
+
+  // Check format version compatibility
+  const spaceFormat = await getConfig(spaceId, 'format_version');
+  if (spaceFormat && formatVersion !== parseInt(spaceFormat)) {
+    return res.status(409).json({ error: 'format_version_mismatch', expected: parseInt(spaceFormat), got: formatVersion || null });
   }
 
   const seqs = await storeChanges(spaceId, changes, req.device.id);
@@ -48,6 +54,21 @@ router.get('/', async (req, res) => {
   const lastSeq = await getLastSeq(spaceId);
 
   res.json({ changes, lastSeq });
+});
+
+// Set format version for the space (idempotent, never downgrades)
+router.post('/format-version', async (req, res) => {
+  const spaceId = req.device.space_id;
+  const { version } = req.body;
+  if (!version || typeof version !== 'number') {
+    return res.status(400).json({ error: 'Missing or invalid version' });
+  }
+  const current = await getConfig(spaceId, 'format_version');
+  if (current && parseInt(current) >= version) {
+    return res.json({ ok: true, formatVersion: parseInt(current) });
+  }
+  await setConfig(spaceId, 'format_version', String(version));
+  res.json({ ok: true, formatVersion: version });
 });
 
 // Store a document snapshot (encrypted)

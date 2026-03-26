@@ -1,4 +1,4 @@
-import Automerge from 'automerge';
+import * as Automerge from '@automerge/automerge';
 import WebSocket from 'ws';
 import { encrypt, decrypt } from './crypto.js';
 
@@ -35,7 +35,7 @@ export async function pullChanges() {
   for (const { data } of changes) {
     try {
       const change = await decrypt(data);
-      doc = Automerge.applyChanges(doc, [change]);
+      [doc] = Automerge.applyChanges(doc, [change]);
     } catch (err) {
       console.warn(`Failed to apply change: ${err.message}`);
     }
@@ -53,8 +53,7 @@ export async function pullSnapshot() {
   const { data, seq } = await res.json();
   if (data) {
     const decrypted = await decrypt(data);
-    const bytes = new Uint8Array(decrypted);
-    doc = Automerge.load(bytes);
+    doc = Automerge.load(decrypted);
     lastSeq = seq || 0;
   }
   return doc;
@@ -63,11 +62,11 @@ export async function pullSnapshot() {
 export async function pushChanges(oldDoc, newDoc) {
   const changes = Automerge.getChanges(oldDoc, newDoc);
   if (changes.length === 0) return;
-  const encrypted = await Promise.all(changes.map(c => encrypt(c)));
+  const encrypted = await Promise.all(changes.map(c => encrypt(Array.from(c))));
   const res = await fetch(`${serverUrl}/api/changes`, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify({ changes: encrypted })
+    body: JSON.stringify({ changes: encrypted, formatVersion: 3 })
   });
   if (!res.ok) throw new Error(`Push failed: ${res.status} ${await res.text()}`);
   const { lastSeq: newSeq } = await res.json();

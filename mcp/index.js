@@ -165,7 +165,7 @@ server.tool('delete_task', 'Delete a task', {
 
   const taskName = doc.todos[idx].name;
   await applyAndPush(d => {
-    d.todos.deleteAt(idx);
+    d.todos.splice(idx, 1);
   });
 
   return { content: [{ type: 'text', text: `Deleted: ${taskName}` }] };

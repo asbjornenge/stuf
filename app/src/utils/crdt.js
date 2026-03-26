@@ -1,9 +1,10 @@
-import Automerge from 'automerge';
+import * as Automerge from '@automerge/automerge';
 import { openDB } from 'idb';
+import { migrateFromV1, createDocFromState } from './migration.js';
 
-let doc = Automerge.init()
+let doc = Automerge.init();
 
-// Hook for sync — called with each new local change (object)
+// Hook for sync — called with each new local change (Uint8Array)
 let _onLocalChange = null;
 export function setOnLocalChange(fn) { _onLocalChange = fn; }
 
@@ -11,90 +12,166 @@ function emitChange(change) {
   if (_onLocalChange) _onLocalChange(change);
 }
 
-const dbPromise = openDB('crdtDB', 1, {
+// --- New IndexedDB: snapshot + unpushed changes ---
+
+const dbPromise = openDB('stufDB', 1, {
   upgrade(db) {
-    db.createObjectStore('crdt', { keyPath: 'id', autoIncrement: true });
+    db.createObjectStore('meta', { keyPath: 'key' });
+    db.createObjectStore('unpushed', { keyPath: 'id', autoIncrement: true });
   },
 });
 
+export const saveSnapshot = async () => {
+  const db = await dbPromise;
+  const binary = Automerge.save(doc);
+  await db.put('meta', { key: 'snapshot', value: binary });
+};
+
+const saveUnpushedChange = async (change) => {
+  const db = await dbPromise;
+  await db.add('unpushed', { change });
+};
+
+export const getUnpushedChanges = async () => {
+  const db = await dbPromise;
+  const records = await db.getAll('unpushed');
+  return records.map(r => r.change);
+};
+
+export const clearUnpushedChanges = async () => {
+  const db = await dbPromise;
+  await db.clear('unpushed');
+};
+
 export const resetCRDT = async () => {
   const db = await dbPromise;
-  await db.clear('crdt');
+  await db.clear('meta');
+  await db.clear('unpushed');
   doc = Automerge.init();
 };
 
-export const saveDocumentSnapshot = () => {
-  const saved = Automerge.save(doc);
-  // Automerge 0.14 save() returns a string (JSON), encode to bytes for encryption
-  const bytes = new TextEncoder().encode(saved);
-  return Array.from(bytes);
+// Reset in-memory doc only (for testing — does not clear DB)
+export const _resetMemory = () => {
+  doc = Automerge.init();
 };
 
-export const loadDocumentSnapshot = async (data) => {
-  const db = await dbPromise;
-  await db.clear('crdt');
-  // Automerge 0.14 load() expects a string
-  const str = new TextDecoder().decode(new Uint8Array(data));
-  doc = Automerge.load(str);
-  // Save all changes from loaded doc to IndexedDB for persistence
-  const changes = Automerge.getAllChanges(doc);
-  for (const change of changes) {
-    await db.add('crdt', { change });
-  }
+// --- Snapshot for sync ---
+
+export const saveDocumentSnapshot = () => {
+  const binary = Automerge.save(doc);
+  return Array.from(binary);
 };
+
+// Automerge 3.x magic bytes: 0x85 0x6f 0x4a 0x83
+const AUTOMERGE_MAGIC = [0x85, 0x6f, 0x4a, 0x83];
+
+function isAutomerge3Format(data) {
+  return data.length >= 4 &&
+    data[0] === AUTOMERGE_MAGIC[0] && data[1] === AUTOMERGE_MAGIC[1] &&
+    data[2] === AUTOMERGE_MAGIC[2] && data[3] === AUTOMERGE_MAGIC[3];
+}
+
+export const loadDocumentSnapshot = async (data) => {
+  const binary = new Uint8Array(data);
+
+  if (isAutomerge3Format(binary)) {
+    // Native Automerge 3.x format
+    doc = Automerge.load(binary);
+  } else {
+    // Legacy 0.14 format (JSON string as bytes) — convert via plain state
+    try {
+      const str = new TextDecoder().decode(binary);
+      const OldAutomerge = await import('automerge-legacy');
+      const oldDoc = OldAutomerge.default.load(str);
+      const plainState = JSON.parse(JSON.stringify(oldDoc));
+      doc = createDocFromState(plainState);
+    } catch (err) {
+      throw new Error('Unable to load snapshot: unrecognized format');
+    }
+  }
+
+  await saveSnapshot();
+  const db = await dbPromise;
+  await db.clear('unpushed');
+};
+
+// --- Init with migration support ---
 
 export const initCRDT = async () => {
   const db = await dbPromise;
-  const allRecords = await db.getAll('crdt')
-  const changes = allRecords
-    .map(record => record.change)
-    .filter(change => change !== undefined);
-  if (changes.length > 0) {
-    doc = Automerge.applyChanges(doc, changes);
+
+  // Fast path: load existing 3.x snapshot
+  const snapshotRecord = await db.get('meta', 'snapshot');
+  if (snapshotRecord) {
+    doc = Automerge.load(snapshotRecord.value);
+    // Replay any unpushed changes
+    const unpushed = await db.getAll('unpushed');
+    if (unpushed.length > 0) {
+      const changes = unpushed.map(r => r.change);
+      [doc] = Automerge.applyChanges(doc, changes);
+    }
+    return;
   }
+
+  // Migration path: check for old crdtDB
+  const migratedDoc = await migrateFromV1();
+  if (migratedDoc) {
+    doc = migratedDoc;
+    await saveSnapshot();
+    return;
+  }
+
+  // Fresh start
+  doc = Automerge.init();
 };
 
-const saveChange = async (change) => {
-  const db = await dbPromise;
-  await db.add('crdt', { change });
-};
+// --- Apply remote changes ---
 
 export const applyRemoteChanges = async (changes) => {
-  for (let i = 0; i < changes.length; i++) {
-    try {
-      const newDoc = Automerge.applyChanges(doc, [changes[i]]);
-      doc = newDoc;
-      await saveChange(changes[i]);
-    } catch (err) {
-      console.warn(`Failed to apply remote change ${i + 1}/${changes.length}:`, err.message);
+  try {
+    [doc] = Automerge.applyChanges(doc, changes);
+  } catch (err) {
+    // Fallback: apply one by one, skip failures
+    for (let i = 0; i < changes.length; i++) {
+      try {
+        [doc] = Automerge.applyChanges(doc, [changes[i]]);
+      } catch (e) {
+        console.warn(`Failed to apply remote change ${i + 1}/${changes.length}:`, e.message);
+      }
     }
   }
+  await saveSnapshot();
 };
 
 export const getDocument = () => doc;
 
-export const getLocalChanges = () => {
-  return Automerge.getAllChanges(doc);
-};
+// --- Helper: change + persist + emit ---
 
-export const addTask = async (task) => {
+async function localChange(message, changeFn) {
   const oldDoc = doc;
-  doc = Automerge.change(doc, 'Add Task', (doc) => {
-    if (!doc.todos) doc.todos = []
-    doc.todos.push(task);
-  });
+  doc = Automerge.change(doc, { message }, changeFn);
   const changes = Automerge.getChanges(oldDoc, doc);
+  if (changes.length === 0) return null;
   const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
+  await saveUnpushedChange(lastChange);
+  await saveSnapshot();
   emitChange(lastChange);
   return lastChange;
+}
+
+// --- Task operations ---
+
+export const addTask = async (task) => {
+  return localChange('Add Task', (d) => {
+    if (!d.todos) d.todos = [];
+    d.todos.push(task);
+  });
 };
 
 export const updateTask = async (id, fields) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Update Task', (doc) => {
-    if (!doc.todos) return;
-    const task = doc.todos.find(t => t.id === id);
+  return localChange('Update Task', (d) => {
+    if (!d.todos) return;
+    const task = d.todos.find(t => t.id === id);
     if (!task) return;
     for (const [key, value] of Object.entries(fields)) {
       if (key === 'id') continue;
@@ -109,66 +186,41 @@ export const updateTask = async (id, fields) => {
       }
     }
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
 
 export const deleteTask = async (id) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Delete Task', (doc) => {
-    if (!doc.todos) return;
-    const index = doc.todos.findIndex((task) => task.id === id);
+  return localChange('Delete Task', (d) => {
+    if (!d.todos) return;
+    const index = d.todos.findIndex((task) => task.id === id);
     if (index !== -1) {
-      doc.todos.splice(index, 1);
+      d.todos.splice(index, 1);
     }
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
+
+// --- Tags ---
 
 export const getGlobalTags = () => {
   return doc.tags ? Array.from(doc.tags).map(t => String(t)) : [];
 };
 
 export const addGlobalTag = async (name) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Add Tag', (doc) => {
-    if (!doc.tags) doc.tags = [];
-    if (!doc.tags.find(t => t === name)) {
-      doc.tags.push(name);
+  return localChange('Add Tag', (d) => {
+    if (!d.tags) d.tags = [];
+    if (!d.tags.find(t => t === name)) {
+      d.tags.push(name);
     }
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
 
 export const deleteGlobalTag = async (name) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Delete Tag', (doc) => {
-    if (!doc.tags) return;
-    const index = doc.tags.findIndex(t => t === name);
+  return localChange('Delete Tag', (d) => {
+    if (!d.tags) return;
+    const index = d.tags.findIndex(t => t === name);
     if (index !== -1) {
-      doc.tags.splice(index, 1);
+      d.tags.splice(index, 1);
     }
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
 
 export const getRecentTags = () => {
@@ -176,68 +228,47 @@ export const getRecentTags = () => {
 };
 
 export const updateRecentTags = async (tags) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Update Recent Tags', (doc) => {
-    doc.recentTags = tags.slice(0, 3);
+  return localChange('Update Recent Tags', (d) => {
+    d.recentTags = tags.slice(0, 3);
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
+
+// --- Projects ---
 
 export const getProjects = () => {
   return doc.projects ? Array.from(doc.projects).map(p => ({ id: p.id, name: String(p.name) })) : [];
 };
 
 export const addProject = async (name) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Add Project', (doc) => {
-    if (!doc.projects) doc.projects = [];
-    doc.projects.push({ id: Date.now(), name });
+  return localChange('Add Project', (d) => {
+    if (!d.projects) d.projects = [];
+    d.projects.push({ id: Date.now(), name });
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
 
 export const deleteProject = async (id) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Delete Project', (doc) => {
-    if (!doc.projects) return;
-    const index = doc.projects.findIndex(p => p.id === id);
+  return localChange('Delete Project', (d) => {
+    if (!d.projects) return;
+    const index = d.projects.findIndex(p => p.id === id);
     if (index !== -1) {
-      doc.projects.splice(index, 1);
+      d.projects.splice(index, 1);
     }
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
 
+// --- Task ordering ---
+
 export const updateTaskOrder = async (taskUpdates) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Update Order', (doc) => {
-    if (!doc.todos) return;
+  return localChange('Update Order', (d) => {
+    if (!d.todos) return;
     taskUpdates.forEach(({ id, order }) => {
-      const task = doc.todos.find(t => t.id === id);
+      const task = d.todos.find(t => t.id === id);
       if (task) task.order = order;
     });
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
+
+// --- Settings ---
 
 export const getSettings = () => {
   if (!doc.settings) return { morningHour: 9, eveningHour: 17, somedayMinDays: 10, somedayMaxDays: 60 };
@@ -250,40 +281,10 @@ export const getSettings = () => {
 };
 
 export const updateSettings = async (newSettings) => {
-  const oldDoc = doc;
-  doc = Automerge.change(doc, 'Update Settings', (doc) => {
-    if (!doc.settings) doc.settings = {};
+  return localChange('Update Settings', (d) => {
+    if (!doc.settings) d.settings = {};
     for (const [key, value] of Object.entries(newSettings)) {
-      doc.settings[key] = value;
+      d.settings[key] = value;
     }
   });
-  const changes = Automerge.getChanges(oldDoc, doc);
-  if (changes.length === 0) return null;
-  const lastChange = changes[changes.length - 1];
-  await saveChange(lastChange);
-  emitChange(lastChange);
-  return lastChange;
 };
-
-
-//(async () => {
-//
-//  // MachineA
-//  let adoc = Automerge.init()
-//  let aadoc = Automerge.change(adoc, 'Add todo', (doc) => {
-//    doc.todos = []
-//  })
-//  let bdoc = Automerge.change(aadoc, 'Add todo', (doc) => {
-//    doc.todos.push({ id: 1, text: 'eplekake' })
-//  })
-//
-//  let changes = Automerge.getChanges(adoc, bdoc)
-//  console.log(changes)
-//
-//  // MachineB
-//  let cdoc = Automerge.init()
-//  let ddoc = Automerge.applyChanges(cdoc, changes)
-//
-//  console.log(adoc.todos, bdoc.todos, cdoc.todos, ddoc.todos)
-//
-//})()

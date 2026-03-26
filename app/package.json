@@ -7,11 +7,13 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "vitest run",
     "preview": "vite preview"
   },
   "dependencies": {
     "@sentry/browser": "^5.30.0",
-    "automerge": "^0.14.2",
+    "@automerge/automerge": "^3.0.0",
+    "automerge-legacy": "npm:automerge@0.14.2",
     "crypto-js": "^4.2.0",
     "framer-motion": "^12.36.0",
     "html5-qrcode": "^2.3.8",
@@ -34,7 +36,11 @@
     "eslint-plugin-react-hooks": "^5.0.0",
     "eslint-plugin-react-refresh": "^0.4.14",
     "globals": "^15.12.0",
+    "fake-indexeddb": "^6.0.0",
     "rollup-plugin-node-polyfills": "^0.2.1",
-    "vite": "^6.0.1"
+    "vitest": "^3.0.0",
+    "vite": "^6.0.1",
+    "vite-plugin-wasm": "^3.3.0",
+    "vite-plugin-top-level-await": "^1.4.4"
   }
 }

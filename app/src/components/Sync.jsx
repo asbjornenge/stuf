@@ -239,6 +239,8 @@ export default function Sync({ onConnect, onRemoteChanges }) {
             )}
             <SpaceInfoLabel>Space</SpaceInfoLabel>
             <SpaceInfoValue>{spaceInfo.spaceId}</SpaceInfoValue>
+            <SpaceInfoLabel>Format</SpaceInfoLabel>
+            <SpaceInfoValue>v{spaceInfo.formatVersion || '?'}</SpaceInfoValue>
             <SpaceInfoLabel>Devices</SpaceInfoLabel>
             {spaceInfo.devices.map((d, i) => (
               <DeviceRow key={d.id}>

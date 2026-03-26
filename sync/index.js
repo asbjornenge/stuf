@@ -83,6 +83,7 @@ async function main() {
     if (!device) return res.status(401).json({ error: 'Unknown device' });
     const devices = await getDevicesForSpace(device.space_id);
     const space = await getSpace(device.space_id);
+    const formatVersion = await getConfig(device.space_id, 'format_version');
     let subscription = null;
     if (space?.stripe_subscription_id) {
       subscription = await getSubscriptionDetails(space.stripe_subscription_id);
@@ -93,6 +94,7 @@ async function main() {
       currentDeviceId: device.id,
       devices: devices.map(d => ({ id: d.id, name: d.name, createdAt: d.created_at })),
       subscription,
+      formatVersion: formatVersion ? parseInt(formatVersion) : null,
     });
   });
 

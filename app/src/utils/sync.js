@@ -5,7 +5,7 @@
 
 import * as Sentry from '@sentry/browser';
 import { encryptChange, decryptChange } from './crypto.js';
-import { applyRemoteChanges, getLocalChanges, setOnLocalChange, saveDocumentSnapshot, loadDocumentSnapshot } from './crdt.js';
+import { applyRemoteChanges, getUnpushedChanges, clearUnpushedChanges, saveSnapshot, setOnLocalChange, saveDocumentSnapshot, loadDocumentSnapshot } from './crdt.js';
 
 let _config = null;       // { serverUrl, deviceToken }
 let _lastSeq = 0;
@@ -59,6 +59,7 @@ export function resetLastSeq() {
 export async function forceResync() {
   if (!getSyncConfig()) return;
   await pushAllLocalChanges();
+  await pushSnapshot();
   resetLastSeq();
   await pullChanges();
 }
@@ -235,16 +236,15 @@ export async function createInvite() {
   return result.inviteToken;
 }
 
-// --- Change serialization (Automerge 0.14 changes are JS objects) ---
+// --- Change serialization (Automerge 3.x changes are Uint8Array) ---
 
 function serializeChange(change) {
-  const json = JSON.stringify(change);
-  return Array.from(new TextEncoder().encode(json));
+  // In 3.x, changes are already Uint8Array
+  return Array.from(change);
 }
 
 function deserializeChange(bytes) {
-  const json = new TextDecoder().decode(new Uint8Array(bytes));
-  return JSON.parse(json);
+  return new Uint8Array(bytes);
 }
 
 // --- Push changes to server ---
@@ -268,11 +268,15 @@ export async function pushChanges(changes) {
 
       await apiFetch('/changes', {
         method: 'POST',
-        body: JSON.stringify({ changes: encrypted }),
+        body: JSON.stringify({ changes: encrypted, formatVersion: 3 }),
       });
     }
+    // All queued changes pushed — save snapshot and clear unpushed
+    await saveSnapshot();
+    await clearUnpushedChanges();
   } catch (err) {
     reportSyncError('push', err);
+    // Changes remain in unpushed store for retry
   } finally {
     _pushing = false;
   }
@@ -288,7 +292,7 @@ export async function pullChanges() {
   const result = await apiFetch(`/changes?since=${_lastSeq}`);
 
   if (result.changes.length > 0) {
-    // Decrypt + deserialize each change back to Automerge change objects
+    // Decrypt + deserialize each change back to Automerge Uint8Array
     const decrypted = await Promise.all(
       result.changes.map(async c => {
         const bytes = await decryptChange(c.data);
@@ -296,7 +300,7 @@ export async function pullChanges() {
       })
     );
 
-    // Apply to local Automerge
+    // Apply to local Automerge (saves snapshot internally)
     await applyRemoteChanges(decrypted);
     _onRemoteChanges?.();
   }
@@ -323,28 +327,28 @@ export async function pullSnapshot() {
   saveLastSeq(result.seq);
 }
 
-// --- Push all local changes (used after initial pairing) ---
+// --- Push unpushed local changes ---
 
 export async function pushAllLocalChanges() {
   if (!getSyncConfig()) return;
 
-  const allChanges = getLocalChanges();
-  if (allChanges.length === 0) return;
+  const unpushed = await getUnpushedChanges();
+  if (unpushed.length === 0) return;
 
   const BATCH_SIZE = 500;
-  for (let i = 0; i < allChanges.length; i += BATCH_SIZE) {
-    const batch = allChanges.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < unpushed.length; i += BATCH_SIZE) {
+    const batch = unpushed.slice(i, i + BATCH_SIZE);
     const encrypted = await Promise.all(
       batch.map(change => encryptChange(serializeChange(change)))
     );
     await apiFetch('/changes', {
       method: 'POST',
-      body: JSON.stringify({ changes: encrypted }),
+      body: JSON.stringify({ changes: encrypted, formatVersion: 3 }),
     });
   }
 
-  // Also push a snapshot for new devices joining later
-  await pushSnapshot();
+  await saveSnapshot();
+  await clearUnpushedChanges();
 }
 
 // --- WebSocket ---
@@ -370,11 +374,12 @@ function connectWebSocket() {
   _ws = ws;
 
   ws.onopen = async () => {
-    Sentry.addBreadcrumb({ category: 'sync', message: 'WebSocket connected, pulling changes' });
+    Sentry.addBreadcrumb({ category: 'sync', message: 'WebSocket connected, syncing' });
     try {
+      await pushAllLocalChanges();
       await pullChanges();
     } catch (err) {
-      reportSyncError('pull-on-reconnect', err);
+      reportSyncError('sync-on-reconnect', err);
     }
   };
 
@@ -406,7 +411,7 @@ function connectWebSocket() {
 // --- Init / Teardown ---
 
 /**
- * Initialize sync: pull remote changes, connect WebSocket.
+ * Initialize sync: push unpushed, pull remote changes, connect WebSocket.
  * @param {Function} onRemoteChanges — called when remote changes are applied
  * @param {Function} onSyncError — called with (context, message) when sync errors occur
  */
@@ -421,22 +426,55 @@ export async function initSync(onRemoteChanges, onSyncError) {
 
   if (!getSyncConfig()) return;
 
+  // Post-migration: push new snapshot and set format version on space
+  if (localStorage.getItem('stuf-needs-migration-push')) {
+    try {
+      await apiFetch('/changes/format-version', {
+        method: 'POST',
+        body: JSON.stringify({ version: 3 }),
+      });
+      await pushSnapshot();
+      resetLastSeq();
+      localStorage.removeItem('stuf-needs-migration-push');
+    } catch (err) {
+      reportSyncError('migration-push', err);
+    }
+  }
+
+  // Ensure space has format_version set (idempotent)
   try {
+    await apiFetch('/changes/format-version', {
+      method: 'POST',
+      body: JSON.stringify({ version: 3 }),
+    });
+  } catch (err) {
+    // Non-fatal — space may already have correct version
+  }
+
+  try {
+    await pushAllLocalChanges();
     await pullChanges();
   } catch (err) {
-    reportSyncError('initial-pull', err);
+    reportSyncError('initial-sync', err);
   }
 
   connectWebSocket();
 
-  // Pull changes when app returns to foreground (critical for iOS)
+  // Push + pull when app returns to foreground
   document.addEventListener('visibilitychange', _onVisibilityChange);
 }
 
 async function _onVisibilityChange() {
   if (document.visibilityState !== 'visible') return;
   if (!getSyncConfig()) return;
-  Sentry.addBreadcrumb({ category: 'sync', message: 'App became visible, pulling changes' });
+  Sentry.addBreadcrumb({ category: 'sync', message: 'App became visible, syncing' });
+
+  try {
+    await pushAllLocalChanges();
+  } catch (err) {
+    reportSyncError('push-on-visibility', err);
+  }
+
   try {
     await pullChanges();
   } catch (err) {
