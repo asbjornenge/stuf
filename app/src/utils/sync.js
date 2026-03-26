@@ -331,14 +331,17 @@ export async function pushAllLocalChanges() {
   const allChanges = getLocalChanges();
   if (allChanges.length === 0) return;
 
-  const encrypted = await Promise.all(
-    allChanges.map(change => encryptChange(serializeChange(change)))
-  );
-
-  await apiFetch('/changes', {
-    method: 'POST',
-    body: JSON.stringify({ changes: encrypted }),
-  });
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < allChanges.length; i += BATCH_SIZE) {
+    const batch = allChanges.slice(i, i + BATCH_SIZE);
+    const encrypted = await Promise.all(
+      batch.map(change => encryptChange(serializeChange(change)))
+    );
+    await apiFetch('/changes', {
+      method: 'POST',
+      body: JSON.stringify({ changes: encrypted }),
+    });
+  }
 
   // Also push a snapshot for new devices joining later
   await pushSnapshot();
