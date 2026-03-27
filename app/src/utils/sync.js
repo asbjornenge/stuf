@@ -19,9 +19,15 @@ let _pushing = false;
 const CONFIG_KEY = 'stuf-sync-config';
 const SEQ_KEY = 'stuf-last-seq';
 
+function isNetworkError(err) {
+  const msg = err.message?.toLowerCase() || '';
+  return msg.includes('failed to fetch') || msg.includes('load failed') || msg.includes('networkerror');
+}
+
 function reportSyncError(context, err) {
   console.warn(`Sync error (${context}):`, err.message);
   Sentry.addBreadcrumb({ category: 'sync', message: context, level: 'error' });
+  if (isNetworkError(err)) return; // Don't notify UI for network errors
   Sentry.captureException(err, { tags: { syncContext: context } });
   _onSyncError?.(context, err.message);
 }

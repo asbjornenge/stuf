@@ -13,7 +13,7 @@ import TaskListItem from './TaskListItem';
 import SearchModal from './SearchModal';
 import SnoozePicker from './SnoozePicker';
 import RuneIcon from './RuneIcon';
-import { CirclePlus, Search, ChevronLeft, Tag, Settings as SettingsIcon, Calendar, Scroll } from 'lucide-react';
+import { CirclePlus, Search, ChevronLeft, Tag, Settings as SettingsIcon, Calendar, Scroll, WifiOff } from 'lucide-react';
 import { colors } from '../theme';
 
 const slideVariants = {
@@ -248,6 +248,19 @@ export default forwardRef(function TaskList(props, ref) {
   const handleSyncError = useCallback((context, message) => {
     showToast(`Sync failed: ${message}`, 'error', 6000);
   }, [showToast]);
+
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+
+  useEffect(() => {
+    const goOffline = () => setIsOffline(true);
+    const goOnline = () => setIsOffline(false);
+    window.addEventListener('offline', goOffline);
+    window.addEventListener('online', goOnline);
+    return () => {
+      window.removeEventListener('offline', goOffline);
+      window.removeEventListener('online', goOnline);
+    };
+  }, []);
 
   const [migrating, setMigrating] = useState(false);
   const [migrationProgress, setMigrationProgress] = useState(0);
@@ -758,6 +771,11 @@ export default forwardRef(function TaskList(props, ref) {
                   setShowNavMenu(true);
                 }
               }}><ChevronLeft size="2rem" /></BackButton>
+              {isOffline && (
+                <OfflineIndicator>
+                  <WifiOff size="0.875rem" />
+                </OfflineIndicator>
+              )}
               <MenuButton onClick={() => setIsMenuOpen(true)}><Search size="1.5rem" /></MenuButton>
             </TopRow>
             <AnimatePresence>
@@ -1058,6 +1076,7 @@ const Header = styled.div`
 `;
 
 const TopRow = styled.div`
+  position: relative;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -1241,6 +1260,16 @@ const ProxyInput = styled.input`
   width: 0;
   height: 0;
   top: -100px;
+`;
+
+const OfflineIndicator = styled.div`
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #666;
+  opacity: 0.5;
+  display: flex;
+  align-items: center;
 `;
 
 const AddButton = styled.button`
