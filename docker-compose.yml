@@ -17,8 +17,6 @@ services:
     image: node:22.5.0-alpine
     working_dir: /app
     command: sh -c "npm install && node --watch index.js"
-    ports:
-      - "3000:3000"
     environment:
       - MODE=${MODE}
       - PAYMENTS_ENABLED=${PAYMENTS_ENABLED}
@@ -29,6 +27,14 @@ services:
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
     volumes:
       - ./sync:/app
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.stuf-sync.rule=Host(`stuf-sync.coder.surflabs.no`)"
+      - "traefik.http.routers.stuf-sync.entrypoints=web"
+      - "traefik.http.services.stuf-sync.loadbalancer.server.port=3000"
+    networks:
+      - proxy
+      - default
     depends_on:
       db:
         condition: service_healthy
@@ -37,12 +43,18 @@ services:
     image: node:22.5.0-alpine
     working_dir: /app
     command: sh -c "npm install && npm run dev -- --host"
-    ports:
-      - "5173:5173"
     environment:
       - VITE_HOSTED_SYNC_URL=${VITE_HOSTED_SYNC_URL}
     volumes:
       - ./app:/app
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.stuf.rule=Host(`stuf.coder.surflabs.no`)"
+      - "traefik.http.routers.stuf.entrypoints=web"
+      - "traefik.http.services.stuf.loadbalancer.server.port=5173"
+    networks:
+      - proxy
+      - default
     depends_on:
       - sync
 
@@ -50,10 +62,20 @@ services:
     image: node:22.5.0-alpine
     working_dir: /app
     command: sh -c "npm install && npm run dev -- --host --port 5174"
-    ports:
-      - "5174:5174"
     volumes:
       - ./landing:/app
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.stuf-landing.rule=Host(`stuf-landing.coder.surflabs.no`)"
+      - "traefik.http.routers.stuf-landing.entrypoints=web"
+      - "traefik.http.services.stuf-landing.loadbalancer.server.port=5174"
+    networks:
+      - proxy
+      - default
 
 volumes:
   pgdata:
+
+networks:
+  proxy:
+    external: true
