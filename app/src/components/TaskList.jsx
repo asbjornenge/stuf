@@ -2,7 +2,8 @@ import React, { useEffect, useState, useMemo, useRef, useCallback, useImperative
 import styled from 'styled-components';
 import { AnimatePresence, motion } from 'framer-motion';
 import { initCRDT, needsMigration, getDocument, addTask, updateTask, deleteTask, updateTaskOrder, getGlobalTags, addGlobalTag, deleteGlobalTag, getRecentTags, updateRecentTags, getProjects, addProject, deleteProject, getSettings, updateSettings } from '../utils/crdt';
-import { initSync, teardownSync, isSyncing } from '../utils/sync';
+import { initSync, teardownSync, isSyncing, getSyncConfig } from '../utils/sync';
+import { decryptChange } from '../utils/crypto';
 import { registerReminder, cancelReminder, subscribeToPush } from '../utils/push';
 import { toPlainTask } from '../utils/task';
 import { useDoubleTap } from '../utils/useDoubleTap';
@@ -286,7 +287,7 @@ export default forwardRef(function TaskList(props, ref) {
         await initCRDT((update) => {
           setMigrationProgress(update.progress);
           addMigrationLog(update.message);
-        });
+        }, getSyncConfig(), decryptChange);
       } catch (err) {
         addMigrationLog(`ERROR: ${err.message}`);
         console.error('initCRDT failed:', err);

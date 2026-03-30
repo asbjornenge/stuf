@@ -99,7 +99,40 @@ export const loadDocumentSnapshot = async (data) => {
 
 // --- Init with migration support ---
 
-export const initCRDT = async (onMigrationProgress) => {
+// Check if space already migrated on server
+async function spaceAlreadyMigrated(syncConfig) {
+  if (!syncConfig) return false;
+  try {
+    const res = await fetch(`${syncConfig.serverUrl}/api/space-info`, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${syncConfig.deviceToken}`,
+      },
+    });
+    if (!res.ok) return false;
+    const info = await res.json();
+    return info.formatVersion >= 3;
+  } catch {
+    return false; // Offline — can't check
+  }
+}
+
+// Pull snapshot from server (used when space is already migrated by another device)
+async function pullServerSnapshot(syncConfig, decryptChange) {
+  const res = await fetch(`${syncConfig.serverUrl}/api/changes/snapshot`, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${syncConfig.deviceToken}`,
+    },
+  });
+  if (!res.ok) return null;
+  const { data, seq } = await res.json();
+  if (!data) return null;
+  const decrypted = await decryptChange(data);
+  return { binary: new Uint8Array(decrypted), seq };
+}
+
+export const initCRDT = async (onMigrationProgress, syncConfig, decryptChange) => {
   const db = await dbPromise;
 
   // Fast path: load existing 3.x snapshot
@@ -116,11 +149,37 @@ export const initCRDT = async (onMigrationProgress) => {
   }
 
   // Migration path: check for old crdtDB
-  const migratedDoc = await migrateFromV1(onMigrationProgress);
-  if (migratedDoc) {
-    doc = migratedDoc;
-    await saveSnapshot();
-    return;
+  const needsMig = await needsMigration();
+  if (needsMig) {
+    // If space is already migrated by another device, pull snapshot instead
+    if (syncConfig && decryptChange) {
+      const alreadyMigrated = await spaceAlreadyMigrated(syncConfig);
+      if (alreadyMigrated) {
+        onMigrationProgress?.({ step: 'pull', message: 'Space already migrated — pulling snapshot from server...', progress: 0.5 });
+        const snapshot = await pullServerSnapshot(syncConfig, decryptChange);
+        if (snapshot) {
+          doc = Automerge.load(snapshot.binary);
+          await saveSnapshot();
+          // Delete old DB
+          await new Promise((resolve) => {
+            const req = indexedDB.deleteDatabase('crdtDB');
+            req.onsuccess = () => resolve();
+            req.onerror = () => resolve();
+          });
+          onMigrationProgress?.({ step: 'done', message: 'Migration complete!', progress: 1 });
+          localStorage.setItem('stuf-last-seq', String(snapshot.seq));
+          return;
+        }
+      }
+    }
+
+    // First device to migrate, or offline — do local migration
+    const migratedDoc = await migrateFromV1(onMigrationProgress);
+    if (migratedDoc) {
+      doc = migratedDoc;
+      await saveSnapshot();
+      return;
+    }
   }
 
   // Fresh start
