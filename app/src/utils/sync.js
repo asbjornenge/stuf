@@ -62,14 +62,6 @@ export function resetLastSeq() {
   localStorage.removeItem(SEQ_KEY);
 }
 
-export async function forceResync() {
-  if (!getSyncConfig()) return;
-  await pushAllLocalChanges();
-  await pushSnapshot();
-  resetLastSeq();
-  await pullChanges();
-}
-
 export function isSyncing() {
   return _config !== null;
 }
@@ -349,10 +341,11 @@ async function maybePushSnapshot() {
   localStorage.setItem(SNAPSHOT_TS_KEY, String(Date.now()));
 }
 
-// --- Recovery: re-push every change from local Automerge doc ---
+// --- Recovery: re-push every local change, then re-pull everything from server ---
 // Server stores duplicates; Automerge applies them idempotently on pull.
-export async function recoverPushAllLocalChanges(onProgress) {
+export async function recoverSync(onProgress) {
   if (!getSyncConfig()) throw new Error('Not configured');
+  await pushAllLocalChanges();
   const all = getAllLocalChanges();
   const BATCH_SIZE = 200;
   for (let i = 0; i < all.length; i += BATCH_SIZE) {
@@ -366,6 +359,8 @@ export async function recoverPushAllLocalChanges(onProgress) {
     });
     onProgress?.(Math.min(i + BATCH_SIZE, all.length), all.length);
   }
+  resetLastSeq();
+  await pullChanges();
   return all.length;
 }
 

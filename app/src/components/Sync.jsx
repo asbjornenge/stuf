@@ -6,7 +6,7 @@ import { X, LoaderCircle } from 'lucide-react';
 import {
   getSyncConfig, isSyncing,
   pairWithServer, pairWithInvite, pushAllLocalChanges,
-  createInvite, initSync, clearSyncConfig, teardownSync, pullSnapshot, forceResync, recoverPushAllLocalChanges, getSpaceInfo, updateDeviceName, deleteDevice,
+  createInvite, initSync, clearSyncConfig, teardownSync, pullSnapshot, recoverSync, getSpaceInfo, updateDeviceName, deleteDevice,
   createCheckout, createSelfHostedSpace, renewSubscription, cancelSubscription,
 } from '../utils/sync';
 import { getEncryptionKey, exportEncryptionKey, importEncryptionKey } from '../utils/crypto';
@@ -58,7 +58,6 @@ export default function Sync({ onConnect, onRemoteChanges }) {
   const [inviteQR, setInviteQR] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [forceSyncState, setForceSyncState] = useState('idle');
   const [recoverState, setRecoverState] = useState('idle');
   const [recoverProgress, setRecoverProgress] = useState(null);
   const [copyState, setCopyState] = useState('idle');
@@ -310,27 +309,12 @@ export default function Sync({ onConnect, onRemoteChanges }) {
               } catch (err) { setError(err.message); }
             }}>Cancel Subscription</ActionButtonSecondary>
           )}
-          <ActionButtonSecondary disabled={forceSyncState === 'loading'} onClick={async () => {
-            setForceSyncState('loading');
-            try {
-              await forceResync();
-              onRemoteChanges?.();
-              setForceSyncState('done');
-              setTimeout(() => setForceSyncState('idle'), 2000);
-            } catch (err) {
-              setError(err.message);
-              setForceSyncState('idle');
-            }
-          }}>
-            {forceSyncState === 'loading' && <Spinner><LoaderCircle size="1rem" /></Spinner>}
-            {forceSyncState === 'loading' ? 'Syncing...' : forceSyncState === 'done' ? 'Done!' : 'Force Sync'}
-          </ActionButtonSecondary>
           <ActionButtonSecondary disabled={recoverState === 'loading'} onClick={async () => {
-            if (!window.confirm('Recover Sync re-uploads this device\'s entire local history to the server. Use only if devices are out of sync and Force Sync did not help. This may take up to a minute. Continue?')) return;
+            if (!window.confirm('Recover Sync re-uploads this device\'s entire local history and re-pulls everything from the server. Use if devices are out of sync. This may take up to a minute. Continue?')) return;
             setRecoverState('loading');
             setRecoverProgress(null);
             try {
-              const total = await recoverPushAllLocalChanges((done, all) => {
+              const total = await recoverSync((done, all) => {
                 setRecoverProgress({ done, total: all });
               });
               onRemoteChanges?.();
