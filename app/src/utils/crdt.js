@@ -64,6 +64,8 @@ export const saveDocumentSnapshot = () => {
   return Array.from(binary);
 };
 
+export const getAllLocalChanges = () => Automerge.getAllChanges(doc);
+
 // Automerge 3.x magic bytes: 0x85 0x6f 0x4a 0x83
 const AUTOMERGE_MAGIC = [0x85, 0x6f, 0x4a, 0x83];
 

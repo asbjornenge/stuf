@@ -5,7 +5,7 @@
 
 import * as Sentry from '@sentry/browser';
 import { encryptChange, decryptChange } from './crypto.js';
-import { applyRemoteChanges, getUnpushedChanges, clearUnpushedChanges, saveSnapshot, setOnLocalChange, saveDocumentSnapshot, loadDocumentSnapshot } from './crdt.js';
+import { applyRemoteChanges, getUnpushedChanges, clearUnpushedChanges, saveSnapshot, setOnLocalChange, saveDocumentSnapshot, loadDocumentSnapshot, getAllLocalChanges } from './crdt.js';
 
 let _config = null;       // { serverUrl, deviceToken }
 let _lastSeq = 0;
@@ -347,6 +347,26 @@ async function maybePushSnapshot() {
 
   await pushSnapshot();
   localStorage.setItem(SNAPSHOT_TS_KEY, String(Date.now()));
+}
+
+// --- Recovery: re-push every change from local Automerge doc ---
+// Server stores duplicates; Automerge applies them idempotently on pull.
+export async function recoverPushAllLocalChanges(onProgress) {
+  if (!getSyncConfig()) throw new Error('Not configured');
+  const all = getAllLocalChanges();
+  const BATCH_SIZE = 200;
+  for (let i = 0; i < all.length; i += BATCH_SIZE) {
+    const batch = all.slice(i, i + BATCH_SIZE);
+    const encrypted = await Promise.all(
+      batch.map(c => encryptChange(serializeChange(c)))
+    );
+    await apiFetch('/changes', {
+      method: 'POST',
+      body: JSON.stringify({ changes: encrypted, formatVersion: 3 }),
+    });
+    onProgress?.(Math.min(i + BATCH_SIZE, all.length), all.length);
+  }
+  return all.length;
 }
 
 // --- Push unpushed local changes ---
