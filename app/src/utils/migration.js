@@ -79,8 +79,8 @@ async function replayWithLegacy(changes, onProgress) {
 }
 
 // Create a new Automerge 3.x document from plain JS state
-export function createDocFromState(state) {
-  return Automerge.change(Automerge.init(), { message: 'Migration from v1' }, (d) => {
+export function createDocFromState(state, message = 'Migration from v1') {
+  return Automerge.change(Automerge.init(), { message }, (d) => {
     if (state.todos) {
       d.todos = [];
       for (const todo of state.todos) {

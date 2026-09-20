@@ -262,6 +262,56 @@ export async function compactChanges(spaceId, graceSeconds) {
   return { deleted: rows.length, compactedSeq };
 }
 
+// --- Epochs ---
+// The document's Automerge history can only grow. Rotating the epoch
+// replaces it with a fresh document (same state, no history): the client
+// pushes the new snapshot, the old change log is dropped, and every push
+// must carry the current epoch so old-history changes cannot mix in.
+
+export async function getEpoch(spaceId) {
+  return parseInt(await getConfig(spaceId, 'epoch')) || 0;
+}
+
+export async function rotateEpoch(spaceId, snapshot, deviceId, newEpoch) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      "SELECT value FROM config WHERE space_id = $1 AND key = 'epoch' FOR UPDATE", [spaceId]
+    );
+    const current = rows.length ? parseInt(rows[0].value) || 0 : 0;
+    if (newEpoch !== current + 1) {
+      await client.query('ROLLBACK');
+      return { ok: false, epoch: current };
+    }
+    const seqRes = await client.query('SELECT MAX(seq) AS s FROM changes WHERE space_id = $1', [spaceId]);
+    const lastSeq = seqRes.rows[0].s || 0;
+    const prev = await client.query(
+      "SELECT value FROM config WHERE space_id = $1 AND key = 'snapshot'", [spaceId]
+    );
+    const set = async (key, value) => client.query(
+      'INSERT INTO config (space_id, key, value) VALUES ($1, $2, $3) ON CONFLICT (space_id, key) DO UPDATE SET value = EXCLUDED.value',
+      [spaceId, key, value]
+    );
+    if (prev.rows.length) await set('snapshot_prev', prev.rows[0].value);
+    await set('snapshot', snapshot);
+    await set('snapshot_seq', String(lastSeq));
+    await set('snapshot_exact', '1');
+    await set('snapshot_device', String(deviceId));
+    await set('snapshot_at', String(Math.floor(Date.now() / 1000)));
+    await set('epoch', String(newEpoch));
+    await set('compacted_seq', String(lastSeq));
+    const del = await client.query('DELETE FROM changes WHERE space_id = $1', [spaceId]);
+    await client.query('COMMIT');
+    return { ok: true, epoch: newEpoch, seq: lastSeq, deleted: del.rowCount };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export async function getSpacesWithSnapshot() {
   const { rows } = await pool.query(
     "SELECT DISTINCT space_id FROM config WHERE key = 'snapshot'"

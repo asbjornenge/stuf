@@ -6,7 +6,7 @@ import { X, LoaderCircle } from 'lucide-react';
 import {
   getSyncConfig, isSyncing,
   pairWithServer, pairWithInvite, pushAllLocalChanges,
-  createInvite, initSync, clearSyncConfig, teardownSync, pullSnapshot, recoverSync, getSpaceInfo, updateDeviceName, deleteDevice,
+  createInvite, initSync, clearSyncConfig, teardownSync, pullSnapshot, recoverSync, compactHistory, getSpaceInfo, updateDeviceName, deleteDevice,
   createCheckout, createSelfHostedSpace, renewSubscription, cancelSubscription,
 } from '../utils/sync';
 import { getEncryptionKey, exportEncryptionKey, importEncryptionKey } from '../utils/crypto';
@@ -60,6 +60,8 @@ export default function Sync({ onConnect, onRemoteChanges }) {
   const [loading, setLoading] = useState(false);
   const [recoverState, setRecoverState] = useState('idle');
   const [recoverProgress, setRecoverProgress] = useState(null);
+  const [compactState, setCompactState] = useState('idle');
+  const [compactResult, setCompactResult] = useState(null);
   const [copyState, setCopyState] = useState('idle');
   const [synced, setSynced] = useState(isSyncing());
   const [spaceInfo, setSpaceInfo] = useState(null);
@@ -331,6 +333,26 @@ export default function Sync({ onConnect, onRemoteChanges }) {
             {recoverState === 'loading'
               ? (recoverProgress ? `Recovering ${recoverProgress.done}/${recoverProgress.total}...` : 'Recovering...')
               : recoverState === 'done' ? 'Done!' : 'Recover Sync'}
+          </ActionButtonSecondary>
+          <ActionButtonSecondary disabled={compactState === 'loading' || recoverState === 'loading'} onClick={async () => {
+            if (!window.confirm('Compact History replaces the shared document with a fresh copy of the current state, dropping the edit history. It makes the app faster and lighter on every device. Run it from a desktop when all devices are in sync. Continue?')) return;
+            setCompactState('loading');
+            setCompactResult(null);
+            try {
+              const result = await compactHistory();
+              onRemoteChanges?.();
+              setCompactState('done');
+              setCompactResult(result);
+              setTimeout(() => { setCompactState('idle'); setCompactResult(null); }, 6000);
+            } catch (err) {
+              setError(err.message);
+              setCompactState('idle');
+            }
+          }}>
+            {compactState === 'loading' && <Spinner><LoaderCircle size="1rem" /></Spinner>}
+            {compactState === 'loading' ? 'Compacting...'
+              : compactState === 'done' ? `Done: ${compactResult?.before ?? '?'} → ${compactResult?.after ?? '?'} changes`
+              : 'Compact History'}
           </ActionButtonSecondary>
           <DisconnectButton onClick={handleDisconnect}>Disconnect</DisconnectButton>
         </Actions>

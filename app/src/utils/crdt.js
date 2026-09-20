@@ -391,6 +391,69 @@ export const mergeServerDoc = async (serverDoc) => {
 
 export const getDocument = () => doc;
 
+// --- Epochs: replacing the document with a history-free one ---
+
+const clonePlain = (v) => JSON.parse(JSON.stringify(v));
+
+export const getPlainState = () => clonePlain(doc);
+
+export const getChangeCount = () => Automerge.getAllChanges(doc).length;
+
+// Same state, no history. Automerge keeps every historical value of every
+// field in memory, so a long-lived document grows far beyond its state.
+export const buildFreshDoc = (state) => createDocFromState(state, 'Compact history');
+
+// Adopt `newDoc` as our document. Everything in it is on the server.
+export const replaceDocument = async (newDoc) => {
+  doc = newDoc;
+  _pushedHeads = Automerge.getHeads(doc);
+  await saveSnapshot();
+  await savePushedHeads();
+};
+
+// After adopting a new epoch, re-apply edits this device had not pushed:
+// tasks that are missing, or newer here than in the adopted document
+// (by `updated`), plus tags and projects that are missing. Deletions cannot
+// be told apart from "not synced yet" and are not replayed.
+export const replayLocalState = async (local) => {
+  const current = getPlainState();
+  const byId = new Map((current.todos || []).map(t => [t.id, t]));
+  const toAdd = [];
+  const toUpdate = [];
+  for (const t of local.todos || []) {
+    const c = byId.get(t.id);
+    if (!c) toAdd.push(t);
+    else if ((t.updated || 0) > (c.updated || 0)) toUpdate.push(t);
+  }
+  const tags = (local.tags || []).filter(x => !(current.tags || []).includes(x));
+  const projects = (local.projects || []).filter(p => !(current.projects || []).some(q => q.id === p.id));
+  const count = toAdd.length + toUpdate.length + tags.length + projects.length;
+  if (count === 0) return 0;
+  await localChange('Replay after compaction', (d) => {
+    if (!d.todos) d.todos = [];
+    for (const t of toAdd) d.todos.push(clonePlain(t));
+    for (const t of toUpdate) {
+      const task = d.todos.find(x => x.id === t.id);
+      if (!task) continue;
+      for (const key of Object.keys(task)) {
+        if (key !== 'id' && !(key in t)) delete task[key];
+      }
+      for (const [key, value] of Object.entries(t)) {
+        if (key !== 'id') task[key] = clonePlain(value);
+      }
+    }
+    if (tags.length) {
+      if (!d.tags) d.tags = [];
+      for (const x of tags) d.tags.push(x);
+    }
+    if (projects.length) {
+      if (!d.projects) d.projects = [];
+      for (const p of projects) d.projects.push({ id: p.id, name: p.name });
+    }
+  });
+  return count;
+};
+
 // --- Helper: change + persist + emit ---
 
 // A local change is (1) applied in memory, (2) persisted, (3) handed to sync.

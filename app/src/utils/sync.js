@@ -19,6 +19,7 @@ import { encryptChange, decryptChange } from './crypto.js';
 import {
   applyRemoteChanges, getUnpushed, needsReconcile, markPushed, markUnknown,
   mergeServerDoc, changeHash, setOnLocalChange, saveDocumentSnapshot,
+  getPlainState, buildFreshDoc, replaceDocument, replayLocalState, getChangeCount,
 } from './crdt.js';
 
 let _config = null;           // { serverUrl, deviceToken }
@@ -30,9 +31,13 @@ let _pushing = null;          // in-flight push promise
 let _pushAgain = false;       // a change arrived while pushing
 let _pulling = null;          // in-flight pull promise
 let _reconciling = null;      // in-flight reconcile promise
+let _adopting = null;         // in-flight epoch adoption promise
 
 const CONFIG_KEY = 'stuf-sync-config';
 const SEQ_KEY = 'stuf-last-seq';
+const EPOCH_KEY = 'stuf-epoch';
+const SNAPSHOT_MIN_INTERVAL = 24 * 60 * 60 * 1000;
+const SNAPSHOT_TS_KEY = 'stuf-last-snapshot-push';
 const PULL_PAGE = 500;   // changes per pull request
 const PUSH_BATCH = 200;  // changes per push request
 
@@ -72,6 +77,23 @@ export function clearSyncConfig() {
   _config = null;
   localStorage.removeItem(CONFIG_KEY);
   localStorage.removeItem(SEQ_KEY);
+  localStorage.removeItem(EPOCH_KEY);
+}
+
+// The epoch identifies which document generation the server holds. It only
+// changes when a device compacts history (see compactHistory).
+export function getEpoch() {
+  try {
+    return parseInt(localStorage.getItem(EPOCH_KEY)) || 0;
+  } catch { return 0; }
+}
+
+function saveEpoch(epoch) {
+  localStorage.setItem(EPOCH_KEY, String(epoch));
+}
+
+function isEpochMismatch(err) {
+  return err?.status === 409 && err?.body?.error === 'epoch_mismatch';
 }
 
 export function resetLastSeq() {
@@ -266,7 +288,7 @@ async function postChanges(changes, onProgress) {
     const entries = await Promise.all(batch.map(toEntry));
     await apiFetch('/changes', {
       method: 'POST',
-      body: JSON.stringify({ changes: entries, formatVersion: 3 }),
+      body: JSON.stringify({ changes: entries, formatVersion: 3, epoch: getEpoch() }),
     });
     onProgress?.(Math.min(i + PUSH_BATCH, changes.length), changes.length);
   }
@@ -286,7 +308,16 @@ async function pushOnce() {
     return;
   }
   if (unpushed.changes.length === 0) return;
-  await postChanges(unpushed.changes);
+  try {
+    await postChanges(unpushed.changes);
+  } catch (err) {
+    if (!isEpochMismatch(err)) throw err;
+    // The document was replaced by another device; adopt it (our pending
+    // edits are replayed on top) and let the loop push again.
+    await adoptEpoch();
+    _pushAgain = true;
+    return;
+  }
   await markPushed(unpushed.heads);
 }
 
@@ -346,10 +377,15 @@ async function pullLoop() {
     } catch (err) {
       if (err.status === 410) {
         // Our cursor predates compacted history: start over from the snapshot.
-        await reconcile();
+        if (Number.isInteger(err.body?.epoch) && err.body.epoch !== getEpoch()) await adoptEpoch();
+        else await reconcile();
         return true;
       }
       throw err;
+    }
+    if (Number.isInteger(page.epoch) && page.epoch !== getEpoch()) {
+      await adoptEpoch();
+      return true;
     }
 
     if (page.changes.length > 0) {
@@ -403,10 +439,19 @@ function reconcile(onProgress) {
     let cursor = 0;
     try {
       const snap = await apiFetch('/changes/snapshot');
+      if (Number.isInteger(snap.epoch) && snap.epoch !== getEpoch()) {
+        // Different document generation: adopt it instead of merging.
+        await adoptEpoch(snap);
+        return 0;
+      }
       serverDoc = Automerge.load(await decryptChange(snap.data));
       cursor = snap.seq || 0;
     } catch (err) {
       if (err.status !== 404) throw err;
+      if (Number.isInteger(err.body?.epoch) && err.body.epoch !== getEpoch()) {
+        // New epoch without a snapshot should not happen; treat as empty.
+        saveEpoch(err.body.epoch);
+      }
       serverDoc = Automerge.init();
     }
 
@@ -446,6 +491,72 @@ export async function pullSnapshot() {
   await reconcile();
 }
 
+// --- Epochs ---
+
+// Adopt the server's current document generation. Local edits that had not
+// been pushed are replayed on top of it (best effort, see replayLocalState),
+// then pushed as ordinary changes in the new epoch.
+function adoptEpoch(snapshot) {
+  if (_adopting) return _adopting;
+  _adopting = (async () => {
+    Sentry.addBreadcrumb({ category: 'sync', message: 'adopt epoch' });
+    const snap = snapshot || await apiFetch('/changes/snapshot');
+    const pending = getUnpushed();
+    const hadLocalEdits = pending === null || pending.changes.length > 0;
+    const local = hadLocalEdits ? getPlainState() : null;
+
+    const newDoc = Automerge.load(await decryptChange(snap.data));
+    await replaceDocument(newDoc);
+    saveEpoch(snap.epoch);
+    saveLastSeq(snap.seq || 0);
+
+    // Changes other devices made in the new epoch since the snapshot.
+    for (let cursor = snap.seq || 0; ;) {
+      const page = await apiFetch(`/changes?since=${cursor}&limit=${PULL_PAGE}`);
+      if (page.changes.length > 0) await applyRemoteChanges(await decryptAll(page.changes));
+      cursor = page.lastSeq;
+      saveLastSeq(cursor);
+      if (!page.hasMore) break;
+    }
+    _onRemoteChanges?.();
+
+    if (local) {
+      const replayed = await replayLocalState(local);
+      if (replayed > 0) Sentry.addBreadcrumb({ category: 'sync', message: `replayed ${replayed} local edits after epoch change` });
+    }
+  })().finally(() => {
+    _adopting = null;
+  });
+  return _adopting;
+}
+
+// Replace the shared document with a fresh one holding the same state and
+// no history. Requires being fully in sync, so nothing is lost. Other
+// devices adopt the new document on their next sync.
+export async function compactHistory() {
+  if (!getSyncConfig()) throw new Error('Not configured');
+  await pushAllLocalChanges();
+  await pullChanges();
+  const pending = getUnpushed();
+  if (pending === null || pending.changes.length > 0) {
+    throw new Error('Device is not fully in sync yet. Try again in a moment.');
+  }
+  const before = getChangeCount();
+  const fresh = buildFreshDoc(getPlainState());
+  const encrypted = await encryptChange(Automerge.save(fresh));
+  const epoch = getEpoch() + 1;
+  const result = await apiFetch('/changes/epoch', {
+    method: 'POST',
+    body: JSON.stringify({ snapshot: encrypted, epoch }),
+  });
+  await replaceDocument(fresh);
+  saveEpoch(result.epoch);
+  saveLastSeq(result.seq || 0);
+  localStorage.setItem(SNAPSHOT_TS_KEY, String(Date.now()));
+  _onRemoteChanges?.();
+  return { before, after: getChangeCount(), dropped: result.deleted };
+}
+
 // --- Snapshot push ---
 
 async function pushSnapshot() {
@@ -454,14 +565,12 @@ async function pushSnapshot() {
   await apiFetch('/changes/snapshot', {
     method: 'POST',
     // `seq` tells the server which changes the snapshot already contains.
-    body: JSON.stringify({ snapshot: encrypted, seq: loadLastSeq() }),
+    body: JSON.stringify({ snapshot: encrypted, seq: loadLastSeq(), epoch: getEpoch() }),
   });
 }
 
 // Periodic snapshot push (max once per 24h), only when fully in sync so the
 // reported seq is exact.
-const SNAPSHOT_MIN_INTERVAL = 24 * 60 * 60 * 1000;
-const SNAPSHOT_TS_KEY = 'stuf-last-snapshot-push';
 
 async function maybePushSnapshot() {
   if (needsReconcile()) return;

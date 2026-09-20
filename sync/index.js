@@ -7,7 +7,7 @@ import webpush from 'web-push';
 import {
   initDB, getMode, getDefaultSpaceId,
   getServerConfig, setServerConfig,
-  initPairing, getConfig, getDeviceCount, getDevicesForSpace, getSpace, hashToken, findDevice, updateDeviceName, deleteDevice,
+  initPairing, getConfig, getDeviceCount, getDevicesForSpace, getSpace, hashToken, findDevice, updateDeviceName, deleteDevice, getEpoch,
   setSpaceSubscription, setSubscriptionStatus,
   upsertSharedNote, getSharedNote,
 } from './db.js';
@@ -84,6 +84,7 @@ async function main() {
     const devices = await getDevicesForSpace(device.space_id);
     const space = await getSpace(device.space_id);
     const formatVersion = await getConfig(device.space_id, 'format_version');
+    const epoch = await getEpoch(device.space_id);
     let subscription = null;
     if (space?.stripe_subscription_id) {
       subscription = await getSubscriptionDetails(space.stripe_subscription_id);
@@ -95,6 +96,7 @@ async function main() {
       devices: devices.map(d => ({ id: d.id, name: d.name, createdAt: d.created_at })),
       subscription,
       formatVersion: formatVersion ? parseInt(formatVersion) : null,
+      epoch,
     });
   });
 

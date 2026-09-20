@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { storeChanges, getChangesSince, getLastSeq, findDevice, getSpace, storeSnapshot, getSnapshot, getConfig, setConfig, getCompactedSeq } from '../db.js';
+import { storeChanges, getChangesSince, getLastSeq, findDevice, getSpace, storeSnapshot, getSnapshot, getConfig, setConfig, getCompactedSeq, getEpoch, rotateEpoch } from '../db.js';
 import { notifyClients } from '../ws.js';
 import { PULL_PAGE_MAX } from '../config.js';
 
@@ -24,10 +24,22 @@ async function requireDevice(req, res, next) {
 
 router.use(requireDevice);
 
+// Pushes must belong to the space's current epoch (see rotateEpoch in db.js).
+// Clients that predate epochs send none, which only matches epoch 0.
+async function requireEpoch(req, res, next) {
+  const epoch = await getEpoch(req.device.space_id);
+  const sent = Number.isInteger(req.body?.epoch) ? req.body.epoch : 0;
+  if (sent !== epoch) {
+    return res.status(409).json({ error: 'epoch_mismatch', epoch });
+  }
+  req.epoch = epoch;
+  next();
+}
+
 // Push encrypted changes.
 // Body: { changes: [ { data, hash } | string ], formatVersion }
 // Changes carrying a hash are de-duplicated; re-pushing is safe and cheap.
-router.post('/', async (req, res) => {
+router.post('/', requireEpoch, async (req, res) => {
   const { changes, formatVersion } = req.body;
   const spaceId = req.device.space_id;
 
@@ -50,7 +62,7 @@ router.post('/', async (req, res) => {
 
   if (stored > 0) notifyClients(req.device.id, spaceId, lastSeq, stored);
 
-  res.json({ stored, duplicates, lastSeq });
+  res.json({ stored, duplicates, lastSeq, epoch: req.epoch });
 });
 
 // Pull changes since a sequence number.
@@ -63,16 +75,17 @@ router.get('/', async (req, res) => {
   const spaceId = req.device.space_id;
   const since = parseInt(req.query.since) || 0;
 
+  const epoch = await getEpoch(spaceId);
   const compactedSeq = await getCompactedSeq(spaceId);
   if (since < compactedSeq) {
-    return res.status(410).json({ error: 'history_compacted', compactedSeq });
+    return res.status(410).json({ error: 'history_compacted', compactedSeq, epoch });
   }
 
   const rawLimit = parseInt(req.query.limit);
   if (!rawLimit || rawLimit < 1) {
     const changes = await getChangesSince(spaceId, since);
     const lastSeq = await getLastSeq(spaceId);
-    return res.json({ changes, lastSeq });
+    return res.json({ changes, lastSeq, epoch });
   }
 
   const limit = Math.min(rawLimit, PULL_PAGE_MAX);
@@ -81,7 +94,7 @@ router.get('/', async (req, res) => {
   const changes = hasMore ? rows.slice(0, limit) : rows;
   const cursor = changes.length > 0 ? changes[changes.length - 1].seq : since;
   const latestSeq = await getLastSeq(spaceId);
-  res.json({ changes, lastSeq: cursor, hasMore, latestSeq });
+  res.json({ changes, lastSeq: cursor, hasMore, latestSeq, epoch });
 });
 
 // Set format version for the space (idempotent, never downgrades)
@@ -102,7 +115,7 @@ router.post('/format-version', async (req, res) => {
 // Store a document snapshot (encrypted).
 // Body: { snapshot, seq } where `seq` is the cursor the device had fully
 // applied when the snapshot was taken (omitted by legacy clients).
-router.post('/snapshot', async (req, res) => {
+router.post('/snapshot', requireEpoch, async (req, res) => {
   const spaceId = req.device.space_id;
   const { snapshot, seq } = req.body;
   if (!snapshot) {
@@ -110,17 +123,38 @@ router.post('/snapshot', async (req, res) => {
   }
   await storeSnapshot(spaceId, snapshot, req.device.id, Number.isInteger(seq) ? seq : undefined);
   const lastSeq = await getLastSeq(spaceId);
-  res.json({ ok: true, seq: lastSeq });
+  res.json({ ok: true, seq: lastSeq, epoch: req.epoch });
 });
 
-// Get the latest snapshot: { data, seq }. Changes with seq > `seq` must be
-// pulled on top of it.
+// Get the latest snapshot: { data, seq, epoch }. Changes with seq > `seq`
+// must be pulled on top of it.
 router.get('/snapshot', async (req, res) => {
-  const result = await getSnapshot(req.device.space_id);
+  const spaceId = req.device.space_id;
+  const result = await getSnapshot(spaceId);
+  const epoch = await getEpoch(spaceId);
   if (!result) {
-    return res.status(404).json({ error: 'No snapshot available' });
+    return res.status(404).json({ error: 'No snapshot available', epoch });
   }
-  res.json(result);
+  res.json({ ...result, epoch });
+});
+
+// Start a new epoch: replace the document with a fresh, history-free one.
+// Body: { snapshot, epoch } where epoch must be the current epoch + 1.
+// Drops the change log (it belongs to the old document) and keeps the old
+// snapshot as snapshot_prev. Every device adopts the new snapshot on its
+// next sync; pushes with the old epoch are rejected with 409.
+router.post('/epoch', async (req, res) => {
+  const spaceId = req.device.space_id;
+  const { snapshot, epoch } = req.body;
+  if (!snapshot || !Number.isInteger(epoch)) {
+    return res.status(400).json({ error: 'Missing snapshot or epoch' });
+  }
+  const result = await rotateEpoch(spaceId, snapshot, req.device.id, epoch);
+  if (!result.ok) {
+    return res.status(409).json({ error: 'epoch_mismatch', epoch: result.epoch });
+  }
+  console.log(`Epoch ${result.epoch} for space ${spaceId}: dropped ${result.deleted} changes`);
+  res.json({ ok: true, epoch: result.epoch, seq: result.seq, deleted: result.deleted });
 });
 
 export default router;

@@ -4,6 +4,7 @@ import { encrypt, decrypt } from './crypto.js';
 
 let doc = Automerge.init();
 let lastSeq = 0;
+let epoch = 0;   // document generation on the server; pushes must match
 let serverUrl = null;
 let deviceToken = null;
 let ws = null;
@@ -40,7 +41,12 @@ export async function pullChanges() {
       return initialize();
     }
     if (!res.ok) throw new Error(`Pull failed: ${res.status} ${await res.text()}`);
-    const { changes, lastSeq: cursor, hasMore } = await res.json();
+    const { changes, lastSeq: cursor, hasMore, epoch: serverEpoch } = await res.json();
+    if (Number.isInteger(serverEpoch) && serverEpoch !== epoch) {
+      // The document was replaced (history compacted): reload from snapshot.
+      lastSeq = 0;
+      return initialize();
+    }
     for (const { data } of changes) {
       try {
         const change = await decrypt(data);
@@ -60,7 +66,8 @@ export async function pullSnapshot() {
     if (res.status === 404) return null;
     throw new Error(`Snapshot pull failed: ${res.status}`);
   }
-  const { data, seq } = await res.json();
+  const { data, seq, epoch: serverEpoch } = await res.json();
+  if (Number.isInteger(serverEpoch)) epoch = serverEpoch;
   if (data) {
     const decrypted = await decrypt(data);
     doc = Automerge.load(decrypted);
@@ -81,8 +88,15 @@ export async function pushChanges(oldDoc, newDoc) {
   const res = await fetch(`${serverUrl}/api/changes`, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify({ changes: entries, formatVersion: 3 })
+    body: JSON.stringify({ changes: entries, formatVersion: 3, epoch })
   });
+  if (res.status === 409) {
+    // Another device compacted history. Reload the new document; the
+    // caller's change was made against the old one and must be redone.
+    lastSeq = 0;
+    await initialize();
+    throw new Error('The shared document was compacted by another device. Please retry the operation.');
+  }
   if (!res.ok) throw new Error(`Push failed: ${res.status} ${await res.text()}`);
   const { lastSeq: newSeq } = await res.json();
   if (newSeq !== undefined) lastSeq = newSeq;

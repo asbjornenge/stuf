@@ -22,7 +22,7 @@ import {
 } from '../crdt.js';
 import {
   saveSyncConfig, clearSyncConfig, pushChanges, pushAllLocalChanges, pullChanges,
-  pullSnapshot, recoverSync, initSync, teardownSync,
+  pullSnapshot, recoverSync, initSync, teardownSync, compactHistory, getEpoch,
 } from '../sync.js';
 import { encryptChange, decryptChange } from '../crypto.js';
 
@@ -60,30 +60,43 @@ async function fakeFetch(url, options = {}) {
 
   if (u.pathname === '/api/changes' && method === 'POST') {
     if (onPush) await onPush();
-    const { changes } = JSON.parse(options.body);
-    return jsonResponse(serverStore(changes));
+    const { changes, epoch } = JSON.parse(options.body);
+    if ((epoch || 0) !== server.epoch) return jsonResponse({ error: 'epoch_mismatch', epoch: server.epoch }, 409);
+    return jsonResponse({ ...serverStore(changes), epoch: server.epoch });
+  }
+  if (u.pathname === '/api/changes/epoch' && method === 'POST') {
+    const { snapshot, epoch } = JSON.parse(options.body);
+    if (epoch !== server.epoch + 1) return jsonResponse({ error: 'epoch_mismatch', epoch: server.epoch }, 409);
+    const deleted = server.changes.length;
+    server.epoch = epoch;
+    server.snapshot = { data: snapshot, seq: server.seq };
+    server.compactedSeq = server.seq;
+    server.changes = [];
+    server.byHash = new Set();
+    return jsonResponse({ ok: true, epoch, seq: server.seq, deleted });
   }
   if (u.pathname === '/api/changes' && method === 'GET') {
     const since = parseInt(u.searchParams.get('since')) || 0;
     if (since < server.compactedSeq) {
-      return jsonResponse({ error: 'history_compacted', compactedSeq: server.compactedSeq }, 410);
+      return jsonResponse({ error: 'history_compacted', compactedSeq: server.compactedSeq, epoch: server.epoch }, 410);
     }
     const limit = parseInt(u.searchParams.get('limit')) || 0;
     const after = server.changes.filter(c => c.seq > since);
-    if (!limit) return jsonResponse({ changes: after, lastSeq: server.seq });
+    if (!limit) return jsonResponse({ changes: after, lastSeq: server.seq, epoch: server.epoch });
     const page = after.slice(0, limit);
     const hasMore = after.length > limit;
     const cursor = page.length ? page[page.length - 1].seq : since;
-    return jsonResponse({ changes: page, lastSeq: cursor, hasMore, latestSeq: server.seq });
+    return jsonResponse({ changes: page, lastSeq: cursor, hasMore, latestSeq: server.seq, epoch: server.epoch });
   }
   if (u.pathname === '/api/changes/snapshot' && method === 'GET') {
-    if (!server.snapshot) return jsonResponse({ error: 'No snapshot available' }, 404);
-    return jsonResponse(server.snapshot);
+    if (!server.snapshot) return jsonResponse({ error: 'No snapshot available', epoch: server.epoch }, 404);
+    return jsonResponse({ ...server.snapshot, epoch: server.epoch });
   }
   if (u.pathname === '/api/changes/snapshot' && method === 'POST') {
-    const { snapshot, seq } = JSON.parse(options.body);
+    const { snapshot, seq, epoch } = JSON.parse(options.body);
+    if ((epoch || 0) !== server.epoch) return jsonResponse({ error: 'epoch_mismatch', epoch: server.epoch }, 409);
     server.snapshot = { data: snapshot, seq: Number.isInteger(seq) ? seq : server.seq };
-    return jsonResponse({ ok: true, seq: server.seq });
+    return jsonResponse({ ok: true, seq: server.seq, epoch: server.epoch });
   }
   if (u.pathname === '/api/changes/format-version') {
     return jsonResponse({ ok: true, formatVersion: 3 });
@@ -120,6 +133,8 @@ function otherDevice() {
       const entries = await Promise.all(changes.map(async c => ({ data: await encryptChange(c), hash: changeHash(c) })));
       return serverStore(entries);
     },
+    // Replace this device's document with the server's (new epoch).
+    async adopt() { doc = await docFromServer(); },
     async pushSnapshot() {
       server.snapshot = { data: await encryptChange(Automerge.save(doc)), seq: server.seq };
     },
@@ -139,7 +154,7 @@ beforeEach(async () => {
     req.onsuccess = req.onerror = req.onblocked = () => resolve();
   })));
   localStorage.clear();
-  server = { changes: [], seq: 0, snapshot: null, byHash: new Set(), compactedSeq: 0 };
+  server = { changes: [], seq: 0, snapshot: null, byHash: new Set(), compactedSeq: 0, epoch: 0 };
   onPush = null;
   requests = [];
   globalThis.fetch = vi.fn(fakeFetch);
@@ -469,5 +484,131 @@ describe('getUnpushedChanges (legacy helper)', () => {
   it('reports everything when server state is unknown', async () => {
     await addTask({ id: 1, name: 'A', completed: false });
     expect(await getUnpushedChanges()).toHaveLength(1);
+  });
+});
+
+// --- Epochs (history compaction) -------------------------------------------
+
+describe('compactHistory', () => {
+  async function buildHistory(n) {
+    await addTask({ id: 1, name: 'A', completed: false, notes: 'x' });
+    for (let i = 0; i < n; i++) await updateTask(1, { notes: 'note '.repeat(50) + i, updated: i });
+    await pushChanges();
+  }
+
+  it('replaces the document with a history-free one and drops the server log', async () => {
+    await buildHistory(20);
+    const rows = server.changes.length;
+    expect(rows).toBeGreaterThan(20);
+
+    const result = await compactHistory();
+    expect(result.before).toBeGreaterThan(20);
+    expect(result.after).toBe(1);
+    expect(result.dropped).toBe(rows);
+    expect(server.changes).toHaveLength(0);
+    expect(server.epoch).toBe(1);
+    expect(getEpoch()).toBe(1);
+    expect(getDocument().todos[0].notes.endsWith('19')).toBe(true);
+    expect(await serverNames()).toEqual(['A']);
+    expect(getUnpushed().changes).toHaveLength(0);
+
+    // Normal syncing continues in the new epoch.
+    await addTask({ id: 2, name: 'B', completed: false });
+    await pushChanges();
+    expect(await serverNames()).toEqual(['A', 'B']);
+    expect(server.changes).toHaveLength(1);
+  });
+
+  it('refuses when the device has unpushed changes', async () => {
+    await buildHistory(3);
+    onPush = () => Promise.reject(new Error('HTTP 500'));
+    await addTask({ id: 2, name: 'B', completed: false });
+    await expect(compactHistory()).rejects.toThrow(/not fully in sync/);
+    expect(server.epoch).toBe(0);
+  });
+
+  it('survives a reload: the new epoch and document are persisted', async () => {
+    await buildHistory(5);
+    await compactHistory();
+    _resetMemory();
+    await initCRDT();
+    expect(getDocument().todos).toHaveLength(1);
+    expect(needsReconcile()).toBe(false);
+    expect(getEpoch()).toBe(1);
+    await addTask({ id: 2, name: 'B', completed: false });
+    await pushChanges();
+    expect(await serverNames()).toEqual(['A', 'B']);
+  });
+});
+
+describe('adopting a new epoch', () => {
+  // Simulate "another device compacted": rotate the server epoch with a fresh
+  // document built from the server state, as a desktop would.
+  async function otherDeviceCompacts(mutate) {
+    const other = otherDevice();
+    await other.syncDown();
+    if (mutate) await other.change(mutate);
+    const plain = JSON.parse(JSON.stringify(other.doc));
+    const { buildFreshDoc } = await import('../crdt.js');
+    const fresh = buildFreshDoc(plain);
+    server.epoch += 1;
+    server.snapshot = { data: await encryptChange(Automerge.save(fresh)), seq: server.seq };
+    server.compactedSeq = server.seq;
+    server.changes = [];
+    server.byHash = new Set();
+    await other.adopt();
+    return other;
+  }
+
+  it('a pull detects the new epoch and adopts the fresh document', async () => {
+    await addTask({ id: 1, name: 'A', completed: false });
+    await pushChanges();
+    await otherDeviceCompacts(d => { d.todos.push({ id: 2, name: 'B', completed: false }); });
+
+    await pullChanges();
+    expect(getEpoch()).toBe(1);
+    expect(localNames()).toEqual(['A', 'B']);
+    expect(getUnpushed().changes).toHaveLength(0);
+    expect(localStorage.getItem('stuf-last-seq')).toBe(String(server.seq));
+  });
+
+  it('a push in the old epoch is rejected, the device adopts and replays its local edits', async () => {
+    await addTask({ id: 1, name: 'A', completed: false, updated: 1 });
+    await addTask({ id: 2, name: 'B', completed: false, updated: 1 });
+    await pushChanges();
+    const other = await otherDeviceCompacts(d => { d.todos[0].name = 'A-remote'; d.todos[0].updated = 5; });
+
+    // Offline edits on this device, made against the old document.
+    await updateTask(2, { name: 'B-local', updated: 10 });
+    await addTask({ id: 3, name: 'C', completed: false, updated: 10 });
+
+    await pushChanges();
+    expect(getEpoch()).toBe(1);
+    // Remote edit kept, local edits replayed on top and pushed.
+    expect(localNames()).toEqual(['A-remote', 'B-local', 'C']);
+    expect(await serverNames()).toEqual(['A-remote', 'B-local', 'C']);
+    await other.syncDown();
+    expect((other.doc.todos || []).map(t => t.name).sort()).toEqual(['A-remote', 'B-local', 'C']);
+  });
+
+  it('reconcile adopts instead of merging when epochs differ', async () => {
+    await addTask({ id: 1, name: 'A', completed: false });
+    await pushChanges();
+    await otherDeviceCompacts(null);
+    await recoverSync();
+    expect(getEpoch()).toBe(1);
+    expect(localNames()).toEqual(['A']);
+    expect(server.changes).toHaveLength(0); // nothing re-pushed
+  });
+
+  it('changes made in the new epoch after the snapshot are pulled during adoption', async () => {
+    await addTask({ id: 1, name: 'A', completed: false });
+    await pushChanges();
+    const other = await otherDeviceCompacts(null);
+    await other.change(d => { d.todos.push({ id: 2, name: 'B', completed: false }); });
+
+    await pullChanges();
+    expect(localNames()).toEqual(['A', 'B']);
+    expect(getUnpushed().changes).toHaveLength(0);
   });
 });
