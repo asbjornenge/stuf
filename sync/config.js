@@ -11,3 +11,8 @@ export const STRIPE_SECRET_KEY = config('STRIPE_SECRET_KEY', '');
 export const STRIPE_PRICE_ID = config('STRIPE_PRICE_ID', '');
 export const STRIPE_WEBHOOK_SECRET = config('STRIPE_WEBHOOK_SECRET', '');
 export const BODY_LIMIT = config('BODY_LIMIT', '50mb');
+// Change-log compaction: delete changes already contained in a space's
+// snapshot once they are older than this many days. 0 disables compaction.
+export const COMPACT_AFTER_DAYS = parseInt(config('COMPACT_AFTER_DAYS', '0')) || 0;
+// Max changes returned per paged pull.
+export const PULL_PAGE_MAX = parseInt(config('PULL_PAGE_MAX', '2000')) || 2000;

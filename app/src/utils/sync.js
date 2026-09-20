@@ -1,23 +1,40 @@
 /**
- * Sync manager — handles push/pull of encrypted Automerge changes
- * with the stuf-server, plus WebSocket for real-time updates.
+ * Sync manager — push/pull of encrypted Automerge changes with the
+ * stuf-server, plus WebSocket for real-time updates.
+ *
+ * Model:
+ * - The server keeps an append-only log of encrypted changes (with a
+ *   plaintext change hash for de-duplication) and one encrypted snapshot.
+ * - What to push is derived from the document: "changes since the heads the
+ *   server is known to have" (see crdt.js). Re-pushing is always safe.
+ * - Pulls are paged by seq cursor. A device with unknown server state
+ *   (fresh, imported, upgraded, or after "Recover Sync") reconciles: it loads
+ *   the server snapshot + changes since, merges, and pushes what the server
+ *   lacks. It never downloads the whole log.
  */
 
 import * as Sentry from '@sentry/browser';
+import * as Automerge from '@automerge/automerge';
 import { encryptChange, decryptChange } from './crypto.js';
-import { applyRemoteChanges, getUnpushedChanges, clearUnpushedChanges, saveSnapshot, setOnLocalChange, saveDocumentSnapshot, loadDocumentSnapshot, getAllLocalChanges } from './crdt.js';
+import {
+  applyRemoteChanges, getUnpushed, needsReconcile, markPushed, markUnknown,
+  mergeServerDoc, changeHash, setOnLocalChange, saveDocumentSnapshot,
+} from './crdt.js';
 
-let _config = null;       // { serverUrl, deviceToken }
-let _lastSeq = 0;
+let _config = null;           // { serverUrl, deviceToken }
 let _ws = null;
 let _wsRetryTimer = null;
 let _onRemoteChanges = null;  // callback when remote changes are applied
 let _onSyncError = null;      // callback when sync errors occur
-let _pushQueue = [];
-let _pushing = false;
+let _pushing = null;          // in-flight push promise
+let _pushAgain = false;       // a change arrived while pushing
+let _pulling = null;          // in-flight pull promise
+let _reconciling = null;      // in-flight reconcile promise
 
 const CONFIG_KEY = 'stuf-sync-config';
 const SEQ_KEY = 'stuf-last-seq';
+const PULL_PAGE = 500;   // changes per pull request
+const PUSH_BATCH = 200;  // changes per push request
 
 function isNetworkError(err) {
   const msg = err.message?.toLowerCase() || '';
@@ -42,7 +59,7 @@ export function getSyncConfig() {
       _config = JSON.parse(stored);
       return _config;
     }
-  } catch {}
+  } catch { /* corrupt config, treat as none */ }
   return null;
 }
 
@@ -58,7 +75,6 @@ export function clearSyncConfig() {
 }
 
 export function resetLastSeq() {
-  _lastSeq = 0;
   localStorage.removeItem(SEQ_KEY);
 }
 
@@ -167,7 +183,6 @@ function loadLastSeq() {
 }
 
 function saveLastSeq(seq) {
-  _lastSeq = seq;
   localStorage.setItem(SEQ_KEY, String(seq));
 }
 
@@ -188,10 +203,15 @@ async function apiFetch(path, options = {}) {
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
+    let err;
     if (body.error === 'space_inactive') {
-      throw new Error('Your sync subscription has expired. Please renew to continue syncing.');
+      err = new Error('Your sync subscription has expired. Please renew to continue syncing.');
+    } else {
+      err = new Error(body.error || `HTTP ${res.status}`);
     }
-    throw new Error(body.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    err.body = body;
+    throw err;
   }
 
   return res.json();
@@ -234,158 +254,225 @@ export async function createInvite() {
   return result.inviteToken;
 }
 
-// --- Change serialization (Automerge 3.x changes are Uint8Array) ---
+// --- Push ---
 
-function serializeChange(change) {
-  // In 3.x, changes are already Uint8Array
-  return Array.from(change);
+async function toEntry(change) {
+  return { data: await encryptChange(change), hash: changeHash(change) };
 }
 
-function deserializeChange(bytes) {
-  return new Uint8Array(bytes);
+async function postChanges(changes, onProgress) {
+  for (let i = 0; i < changes.length; i += PUSH_BATCH) {
+    const batch = changes.slice(i, i + PUSH_BATCH);
+    const entries = await Promise.all(batch.map(toEntry));
+    await apiFetch('/changes', {
+      method: 'POST',
+      body: JSON.stringify({ changes: entries, formatVersion: 3 }),
+    });
+    onProgress?.(Math.min(i + PUSH_BATCH, changes.length), changes.length);
+  }
 }
 
-// --- Push changes to server ---
+// Push everything the server lacks. The heads are captured together with
+// the changes, so a local change made while the request is in flight is
+// not covered by them and is picked up by the next push.
+async function pushOnce() {
+  if (needsReconcile()) {
+    await reconcile();
+    return;
+  }
+  const unpushed = getUnpushed();
+  if (unpushed === null) {
+    await reconcile();
+    return;
+  }
+  if (unpushed.changes.length === 0) return;
+  await postChanges(unpushed.changes);
+  await markPushed(unpushed.heads);
+}
 
-export async function pushChanges(changes) {
-  if (!getSyncConfig()) return;
-
-  // Queue changes
-  _pushQueue.push(...changes);
-  if (_pushing) return;
-
-  _pushing = true;
-  try {
-    while (_pushQueue.length > 0) {
-      const batch = _pushQueue.splice(0, _pushQueue.length);
-
-      // Serialize + encrypt each change
-      const encrypted = await Promise.all(
-        batch.map(change => encryptChange(serializeChange(change)))
-      );
-
-      await apiFetch('/changes', {
-        method: 'POST',
-        body: JSON.stringify({ changes: encrypted, formatVersion: 3 }),
-      });
+// Single-flight push. Calls while a push is running mark it to run again
+// afterwards, so nothing is skipped. Never throws; errors are reported and
+// the changes stay unpushed until the next attempt.
+function schedulePush() {
+  if (!getSyncConfig()) return Promise.resolve(false);
+  if (_pushing) {
+    _pushAgain = true;
+    return _pushing;
+  }
+  _pushing = (async () => {
+    let ok = true;
+    try {
+      do {
+        _pushAgain = false;
+        await pushOnce();
+      } while (_pushAgain);
+    } catch (err) {
+      ok = false;
+      reportSyncError('push', err);
+    } finally {
+      _pushing = null;
     }
-    // All queued changes pushed — save snapshot and clear unpushed
-    await saveSnapshot();
-    await clearUnpushedChanges();
-  } catch (err) {
-    reportSyncError('push', err);
-    // Changes remain in unpushed store for retry
-  } finally {
-    _pushing = false;
+    return ok;
+  })();
+  return _pushing;
+}
+
+// Kept for callers that pass the change they just made; the push itself is
+// derived from the document, so the argument is not needed.
+export function pushChanges() {
+  return schedulePush();
+}
+
+export async function pushAllLocalChanges() {
+  return schedulePush();
+}
+
+// --- Pull ---
+
+async function decryptAll(entries) {
+  return Promise.all(entries.map(c => decryptChange(c.data)));
+}
+
+async function pullLoop() {
+  if (needsReconcile()) {
+    await reconcile();
+    return true;
+  }
+  let received = false;
+  for (;;) {
+    let page;
+    try {
+      page = await apiFetch(`/changes?since=${loadLastSeq()}&limit=${PULL_PAGE}`);
+    } catch (err) {
+      if (err.status === 410) {
+        // Our cursor predates compacted history: start over from the snapshot.
+        await reconcile();
+        return true;
+      }
+      throw err;
+    }
+
+    if (page.changes.length > 0) {
+      const decrypted = await decryptAll(page.changes);
+      let persisted = true;
+      try {
+        await applyRemoteChanges(decrypted);
+      } catch (err) {
+        // Applied in memory but not on disk. Show them, but keep the cursor so
+        // they are pulled again (idempotent) once storage works.
+        persisted = false;
+        reportSyncError('persist-remote', err);
+      }
+      _onRemoteChanges?.();
+      if (!persisted) return true;
+      received = true;
+    }
+
+    saveLastSeq(page.lastSeq);
+    if (!page.hasMore) return received;
   }
 }
 
-// --- Pull changes from server ---
+// Single-flight pull of everything after our cursor, page by page.
+export function pullChanges() {
+  if (!getSyncConfig()) return Promise.resolve(false);
+  if (_pulling) return _pulling;
+  _pulling = (async () => {
+    try {
+      return await pullLoop();
+    } finally {
+      _pulling = null;
+    }
+  })();
+  return _pulling;
+}
 
-export async function pullChanges() {
-  if (!getSyncConfig()) return false;
+// --- Reconcile ---
+//
+// Build the server's document from its snapshot plus the changes after it,
+// merge it into ours, push whatever the server lacks, and record the result
+// as the new known server state. This is the only path that ever loads
+// server history without a cursor, and it is bounded by snapshot size +
+// changes since the snapshot, never by total history.
+function reconcile(onProgress) {
+  if (_reconciling) return _reconciling;
+  _reconciling = (async () => {
+    Sentry.addBreadcrumb({ category: 'sync', message: 'reconcile' });
 
-  _lastSeq = loadLastSeq();
+    let serverDoc;
+    let cursor = 0;
+    try {
+      const snap = await apiFetch('/changes/snapshot');
+      serverDoc = Automerge.load(await decryptChange(snap.data));
+      cursor = snap.seq || 0;
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      serverDoc = Automerge.init();
+    }
 
-  const result = await apiFetch(`/changes?since=${_lastSeq}`);
+    for (;;) {
+      const page = await apiFetch(`/changes?since=${cursor}&limit=${PULL_PAGE}`);
+      if (page.changes.length > 0) {
+        [serverDoc] = Automerge.applyChanges(serverDoc, await decryptAll(page.changes));
+      }
+      cursor = page.lastSeq;
+      if (!page.hasMore) break;
+    }
 
-  if (result.changes.length > 0) {
-    // Decrypt + deserialize each change back to Automerge Uint8Array
-    const decrypted = await Promise.all(
-      result.changes.map(async c => {
-        const bytes = await decryptChange(c.data);
-        return deserializeChange(bytes);
-      })
-    );
-
-    // Apply to local Automerge (saves snapshot internally)
-    await applyRemoteChanges(decrypted);
+    const { toPush, heads } = await mergeServerDoc(serverDoc);
+    saveLastSeq(cursor);
     _onRemoteChanges?.();
-  }
 
-  saveLastSeq(result.lastSeq);
-  return result.changes.length > 0;
+    await postChanges(toPush, onProgress);
+    await markPushed(heads);
+    return toPush.length;
+  })().finally(() => {
+    _reconciling = null;
+  });
+  return _reconciling;
 }
 
-// --- Snapshot (for initial sync) ---
+// "Recover Sync": forget what we think the server has and reconcile.
+// Safe to run any time; cost is one snapshot download plus the local diff.
+export async function recoverSync(onProgress) {
+  if (!getSyncConfig()) throw new Error('Not configured');
+  await markUnknown();
+  return reconcile(onProgress);
+}
+
+// Used when joining a space on a fresh device: adopt the server's document.
+export async function pullSnapshot() {
+  await markUnknown();
+  await reconcile();
+}
+
+// --- Snapshot push ---
 
 async function pushSnapshot() {
   const snapshot = saveDocumentSnapshot();
   const encrypted = await encryptChange(snapshot);
   await apiFetch('/changes/snapshot', {
     method: 'POST',
-    body: JSON.stringify({ snapshot: encrypted }),
+    // `seq` tells the server which changes the snapshot already contains.
+    body: JSON.stringify({ snapshot: encrypted, seq: loadLastSeq() }),
   });
 }
 
-export async function pullSnapshot() {
-  const result = await apiFetch('/changes/snapshot');
-  const decrypted = await decryptChange(result.data);
-  await loadDocumentSnapshot(decrypted);
-  saveLastSeq(result.seq);
-}
-
-// --- Periodic snapshot push (max once per 24h) ---
-
+// Periodic snapshot push (max once per 24h), only when fully in sync so the
+// reported seq is exact.
 const SNAPSHOT_MIN_INTERVAL = 24 * 60 * 60 * 1000;
 const SNAPSHOT_TS_KEY = 'stuf-last-snapshot-push';
 
 async function maybePushSnapshot() {
-  const unpushed = await getUnpushedChanges();
-  if (unpushed.length > 0) return;
+  if (needsReconcile()) return;
+  const unpushed = getUnpushed();
+  if (!unpushed || unpushed.changes.length > 0) return;
 
   const lastPush = parseInt(localStorage.getItem(SNAPSHOT_TS_KEY)) || 0;
   if (Date.now() - lastPush < SNAPSHOT_MIN_INTERVAL) return;
 
   await pushSnapshot();
   localStorage.setItem(SNAPSHOT_TS_KEY, String(Date.now()));
-}
-
-// --- Recovery: re-push every local change, then re-pull everything from server ---
-// Server stores duplicates; Automerge applies them idempotently on pull.
-export async function recoverSync(onProgress) {
-  if (!getSyncConfig()) throw new Error('Not configured');
-  await pushAllLocalChanges();
-  const all = getAllLocalChanges();
-  const BATCH_SIZE = 200;
-  for (let i = 0; i < all.length; i += BATCH_SIZE) {
-    const batch = all.slice(i, i + BATCH_SIZE);
-    const encrypted = await Promise.all(
-      batch.map(c => encryptChange(serializeChange(c)))
-    );
-    await apiFetch('/changes', {
-      method: 'POST',
-      body: JSON.stringify({ changes: encrypted, formatVersion: 3 }),
-    });
-    onProgress?.(Math.min(i + BATCH_SIZE, all.length), all.length);
-  }
-  resetLastSeq();
-  await pullChanges();
-  return all.length;
-}
-
-// --- Push unpushed local changes ---
-
-export async function pushAllLocalChanges() {
-  if (!getSyncConfig()) return;
-
-  const unpushed = await getUnpushedChanges();
-  if (unpushed.length === 0) return;
-
-  const BATCH_SIZE = 500;
-  for (let i = 0; i < unpushed.length; i += BATCH_SIZE) {
-    const batch = unpushed.slice(i, i + BATCH_SIZE);
-    const encrypted = await Promise.all(
-      batch.map(change => encryptChange(serializeChange(change)))
-    );
-    await apiFetch('/changes', {
-      method: 'POST',
-      body: JSON.stringify({ changes: encrypted, formatVersion: 3 }),
-    });
-  }
-
-  await saveSnapshot();
-  await clearUnpushedChanges();
 }
 
 // --- WebSocket ---
@@ -448,7 +535,7 @@ function connectWebSocket() {
 // --- Init / Teardown ---
 
 /**
- * Initialize sync: push unpushed, pull remote changes, connect WebSocket.
+ * Initialize sync: push what the server lacks, pull remote changes, connect WebSocket.
  * @param {Function} onRemoteChanges — called when remote changes are applied
  * @param {Function} onSyncError — called with (context, message) when sync errors occur
  */
@@ -456,10 +543,8 @@ export async function initSync(onRemoteChanges, onSyncError) {
   _onRemoteChanges = onRemoteChanges;
   _onSyncError = onSyncError || null;
 
-  // Register hook to auto-push local changes to server
-  setOnLocalChange((change) => {
-    pushChanges([change]);
-  });
+  // Every local change kicks a push; what to send is derived from the document.
+  setOnLocalChange(() => { schedulePush(); });
 
   if (!getSyncConfig()) return;
 
@@ -471,7 +556,7 @@ export async function initSync(onRemoteChanges, onSyncError) {
         body: JSON.stringify({ version: 3 }),
       });
       await pushSnapshot();
-      resetLastSeq();
+      await markUnknown();
       localStorage.removeItem('stuf-needs-migration-push');
     } catch (err) {
       reportSyncError('migration-push', err);
@@ -484,7 +569,7 @@ export async function initSync(onRemoteChanges, onSyncError) {
       method: 'POST',
       body: JSON.stringify({ version: 3 }),
     });
-  } catch (err) {
+  } catch {
     // Non-fatal — space may already have correct version
   }
 
@@ -507,11 +592,7 @@ async function _onVisibilityChange() {
   if (!getSyncConfig()) return;
   Sentry.addBreadcrumb({ category: 'sync', message: 'App became visible, syncing' });
 
-  try {
-    await pushAllLocalChanges();
-  } catch (err) {
-    reportSyncError('push-on-visibility', err);
-  }
+  await pushAllLocalChanges();
 
   try {
     await pullChanges();

@@ -6,7 +6,19 @@ export { needsMigration };
 
 let doc = null;
 
-// Hook for sync — called with each new local change (Uint8Array)
+// Heads of the document as far as the server is known to have it. Everything
+// the server lacks is derived from the document itself as "changes since
+// these heads", so there is no separate queue that can get out of step.
+// null means unknown (fresh install, after import/reset, or upgraded from the
+// old storage format) and makes the next sync reconcile against the server.
+let _pushedHeads = null;
+
+// Number of incremental chunks written since the last full snapshot.
+let _incrementCount = 0;
+// Local storage is compacted into a full snapshot after this many increments.
+const COMPACT_EVERY = 100;
+
+// Hook for sync — called after each local change
 let _onLocalChange = null;
 export function setOnLocalChange(fn) { _onLocalChange = fn; }
 
@@ -14,50 +26,166 @@ function emitChange(change) {
   if (_onLocalChange) _onLocalChange(change);
 }
 
-// --- New IndexedDB: snapshot + unpushed changes ---
+// Hook so the UI can warn the user when local storage is failing.
+let _onPersistError = null;
+export function setOnPersistError(fn) { _onPersistError = fn; }
 
-const dbPromise = openDB('stufDB', 1, {
-  upgrade(db) {
-    db.createObjectStore('meta', { keyPath: 'key' });
-    db.createObjectStore('unpushed', { keyPath: 'id', autoIncrement: true });
-  },
-});
+// --- IndexedDB ---
+//
+// v1: meta { snapshot }, unpushed { change }
+// v2: + increments { bytes }  (Automerge.saveIncremental chunks since the last
+//       full snapshot), meta { pushedHeads }. 'unpushed' is only read once to
+//       migrate old data.
+//
+// The browser may close the connection behind our back (storage errors,
+// quota, app backgrounded on mobile). Every operation on a closed connection
+// throws InvalidStateError, so we never keep a permanent handle: getDB()
+// reopens on demand and withDB() retries once after a forced close.
+let _dbPromise = null;
 
+function openStufDB() {
+  return openDB('stufDB', 2, {
+    upgrade(db, oldVersion) {
+      if (oldVersion < 1) {
+        db.createObjectStore('meta', { keyPath: 'key' });
+        db.createObjectStore('unpushed', { keyPath: 'id', autoIncrement: true });
+      }
+      if (oldVersion < 2) {
+        db.createObjectStore('increments', { autoIncrement: true });
+      }
+    },
+    terminated() {
+      _dbPromise = null;
+    },
+  });
+}
+
+function getDB() {
+  if (!_dbPromise) _dbPromise = openStufDB();
+  return _dbPromise;
+}
+
+function isClosedConnectionError(err) {
+  return err?.name === 'InvalidStateError';
+}
+
+async function withDB(fn) {
+  try {
+    return await fn(await getDB());
+  } catch (err) {
+    if (!isClosedConnectionError(err)) throw err;
+    console.warn('IndexedDB connection was closed, reopening');
+    _dbPromise = null;
+    return fn(await getDB());
+  }
+}
+
+// Test hook: the live connection, so tests can close it and verify recovery.
+export const _getDB = () => getDB();
+
+// --- Persistence ---
+
+// Full snapshot of the document, replacing all incremental chunks (atomic).
 export const saveSnapshot = async () => {
-  const db = await dbPromise;
   const binary = Automerge.save(doc);
-  await db.put('meta', { key: 'snapshot', value: binary });
+  await withDB(async (db) => {
+    const tx = db.transaction(['meta', 'increments'], 'readwrite');
+    tx.objectStore('meta').put({ key: 'snapshot', value: binary });
+    tx.objectStore('increments').clear();
+    await tx.done;
+  });
+  _incrementCount = 0;
 };
 
-const saveUnpushedChange = async (change) => {
-  const db = await dbPromise;
-  await db.add('unpushed', { change });
+// Persist only what changed since the last save, as one small chunk. With a
+// long history this is what keeps every edit from rewriting megabytes.
+const persistIncrement = async () => {
+  const bytes = Automerge.saveIncremental(doc);
+  if (bytes.length === 0) return;
+  try {
+    await withDB(db => db.add('increments', { bytes }));
+  } catch (err) {
+    // Automerge has already marked these bytes as saved, so a full snapshot
+    // is the only way left to get them on disk.
+    console.warn('Increment write failed, falling back to full snapshot:', err.message);
+    await saveSnapshot();
+    return;
+  }
+  _incrementCount++;
+  if (_incrementCount >= COMPACT_EVERY) await saveSnapshot();
 };
 
+const savePushedHeads = () =>
+  withDB(db => db.put('meta', { key: 'pushedHeads', value: _pushedHeads }));
+
+function headsEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((h, i) => h === sb[i]);
+}
+
+// --- What the server has ---
+
+export const getHeads = () => Automerge.getHeads(doc);
+export const getPushedHeads = () => _pushedHeads;
+export const needsReconcile = () => _pushedHeads === null;
+export const changeHash = (change) => Automerge.decodeChange(change).hash;
+
+// Changes the server does not have yet, plus the heads that are fully pushed
+// once those changes are stored. null when unknown (reconcile needed).
+export const getUnpushed = () => {
+  if (_pushedHeads === null) return null;
+  const heads = Automerge.getHeads(doc);
+  if (headsEqual(heads, _pushedHeads)) return { changes: [], heads };
+  try {
+    return { changes: Automerge.getChanges(Automerge.view(doc, _pushedHeads), doc), heads };
+  } catch (err) {
+    console.warn('pushedHeads not in document history, reconcile needed:', err.message);
+    return null;
+  }
+};
+
+// All changes not known to be on the server (everything, when unknown).
 export const getUnpushedChanges = async () => {
-  const db = await dbPromise;
-  const records = await db.getAll('unpushed');
-  return records.map(r => r.change);
+  const unpushed = getUnpushed();
+  return unpushed ? unpushed.changes : Automerge.getAllChanges(doc);
 };
 
-export const clearUnpushedChanges = async () => {
-  const db = await dbPromise;
-  await db.clear('unpushed');
+export const markPushed = async (heads) => {
+  _pushedHeads = heads;
+  await savePushedHeads();
 };
+
+export const markUnknown = async () => {
+  _pushedHeads = null;
+  await savePushedHeads();
+};
+
+// "Everything currently in the document is on the server."
+export const clearUnpushedChanges = async () => markPushed(Automerge.getHeads(doc));
 
 export const resetCRDT = async () => {
-  const db = await dbPromise;
-  await db.clear('meta');
-  await db.clear('unpushed');
+  await withDB(async (db) => {
+    const tx = db.transaction(['meta', 'unpushed', 'increments'], 'readwrite');
+    tx.objectStore('meta').clear();
+    tx.objectStore('unpushed').clear();
+    tx.objectStore('increments').clear();
+    await tx.done;
+  });
   doc = Automerge.init();
+  _pushedHeads = null;
+  _incrementCount = 0;
 };
 
-// Reset in-memory doc only (for testing — does not clear DB)
+// Reset in-memory state only (for testing — does not clear DB)
 export const _resetMemory = () => {
   doc = Automerge.init();
+  _pushedHeads = null;
+  _incrementCount = 0;
 };
 
-// --- Snapshot for sync ---
+// --- Snapshot for sync / backup ---
 
 export const saveDocumentSnapshot = () => {
   const binary = Automerge.save(doc);
@@ -75,6 +203,8 @@ function isAutomerge3Format(data) {
     data[2] === AUTOMERGE_MAGIC[2] && data[3] === AUTOMERGE_MAGIC[3];
 }
 
+// Replace the document wholesale (backup import). What the server has is
+// unknown afterwards, so the next sync reconciles.
 export const loadDocumentSnapshot = async (data) => {
   const binary = new Uint8Array(data);
 
@@ -89,14 +219,15 @@ export const loadDocumentSnapshot = async (data) => {
       const oldDoc = OldAutomerge.default.load(str);
       const plainState = JSON.parse(JSON.stringify(oldDoc));
       doc = createDocFromState(plainState);
-    } catch (err) {
+    } catch {
       throw new Error('Unable to load snapshot: unrecognized format');
     }
   }
 
+  _pushedHeads = null;
   await saveSnapshot();
-  const db = await dbPromise;
-  await db.clear('unpushed');
+  await savePushedHeads();
+  await withDB(db => db.clear('unpushed'));
 };
 
 // --- Init with migration support ---
@@ -135,17 +266,38 @@ async function pullServerSnapshot(syncConfig, decryptChange) {
 }
 
 export const initCRDT = async (onMigrationProgress, syncConfig, decryptChange) => {
-  const db = await dbPromise;
+  // Fast path: load existing snapshot + incremental chunks. A document that
+  // has only ever been saved incrementally has chunks but no snapshot yet.
+  const snapshotRecord = await withDB(db => db.get('meta', 'snapshot'));
+  const increments = await withDB(db => db.getAll('increments'));
+  if (snapshotRecord || increments.length > 0) {
+    doc = snapshotRecord ? Automerge.load(snapshotRecord.value) : Automerge.init();
 
-  // Fast path: load existing 3.x snapshot
-  const snapshotRecord = await db.get('meta', 'snapshot');
-  if (snapshotRecord) {
-    doc = Automerge.load(snapshotRecord.value);
-    // Replay any unpushed changes
-    const unpushed = await db.getAll('unpushed');
+    let corrupt = false;
+    for (const inc of increments) {
+      try {
+        doc = Automerge.loadIncremental(doc, inc.bytes);
+      } catch (err) {
+        corrupt = true;
+        console.warn('Skipping unreadable increment:', err.message);
+      }
+    }
+    _incrementCount = increments.length;
+
+    const headsRecord = await withDB(db => db.get('meta', 'pushedHeads'));
+    _pushedHeads = headsRecord?.value ?? null;
+
+    // Old storage format: changes waiting in 'unpushed'. Fold them in and let
+    // the next sync reconcile against the server.
+    const unpushed = await withDB(db => db.getAll('unpushed'));
     if (unpushed.length > 0) {
-      const changes = unpushed.map(r => r.change);
-      [doc] = Automerge.applyChanges(doc, changes);
+      [doc] = Automerge.applyChanges(doc, unpushed.map(r => r.change));
+      _pushedHeads = null;
+      await withDB(db => db.clear('unpushed'));
+    }
+
+    if (corrupt || unpushed.length > 0 || _incrementCount >= COMPACT_EVERY) {
+      await saveSnapshot();
     }
     return;
   }
@@ -161,7 +313,9 @@ export const initCRDT = async (onMigrationProgress, syncConfig, decryptChange) =
         const snapshot = await pullServerSnapshot(syncConfig, decryptChange);
         if (snapshot) {
           doc = Automerge.load(snapshot.binary);
+          _pushedHeads = Automerge.getHeads(doc);
           await saveSnapshot();
+          await savePushedHeads();
           // Delete old DB
           await new Promise((resolve) => {
             const req = indexedDB.deleteDatabase('crdtDB');
@@ -179,6 +333,7 @@ export const initCRDT = async (onMigrationProgress, syncConfig, decryptChange) =
     const migratedDoc = await migrateFromV1(onMigrationProgress);
     if (migratedDoc) {
       doc = migratedDoc;
+      _pushedHeads = null;
       await saveSnapshot();
       return;
     }
@@ -186,15 +341,24 @@ export const initCRDT = async (onMigrationProgress, syncConfig, decryptChange) =
 
   // Fresh start
   doc = Automerge.init();
+  _pushedHeads = null;
 };
 
 // --- Apply remote changes ---
 
+// Applies remote changes to the in-memory document, then persists them. If
+// persisting fails the changes are still in memory (so the UI can show
+// them), but the error propagates so the caller does not advance its cursor
+// — the changes will simply be pulled again, which is idempotent.
 export const applyRemoteChanges = async (changes) => {
+  const before = Automerge.getHeads(doc);
+  const fullyPushed = _pushedHeads !== null && headsEqual(before, _pushedHeads);
+
   try {
     [doc] = Automerge.applyChanges(doc, changes);
   } catch (err) {
     // Fallback: apply one by one, skip failures
+    console.warn('Batch apply failed, applying one by one:', err.message);
     for (let i = 0; i < changes.length; i++) {
       try {
         [doc] = Automerge.applyChanges(doc, [changes[i]]);
@@ -203,22 +367,51 @@ export const applyRemoteChanges = async (changes) => {
       }
     }
   }
+
+  // Everything local was already on the server and these came from the
+  // server, so the server now has exactly this document. (If local changes
+  // were pending, the next push re-sends the remote ones too; the server
+  // de-duplicates them.)
+  if (fullyPushed) _pushedHeads = Automerge.getHeads(doc);
+
+  await persistIncrement();
+  if (fullyPushed) await savePushedHeads();
+};
+
+// Merge the server's document (snapshot + changes) into ours. Returns the
+// changes the server is missing and the heads that are fully pushed once
+// those are stored.
+export const mergeServerDoc = async (serverDoc) => {
+  doc = Automerge.merge(doc, serverDoc);
+  const heads = Automerge.getHeads(doc);
+  const toPush = Automerge.getChanges(serverDoc, doc);
   await saveSnapshot();
+  return { toPush, heads };
 };
 
 export const getDocument = () => doc;
 
 // --- Helper: change + persist + emit ---
 
+// A local change is (1) applied in memory, (2) persisted, (3) handed to sync.
+// Step 2 can fail if local storage is broken; the change must still reach
+// the server, so step 3 always happens. The server is the durable copy of
+// last resort, and pushes are derived from the document, not from disk.
 async function localChange(message, changeFn) {
   const oldDoc = doc;
   doc = Automerge.change(doc, { message }, changeFn);
   const changes = Automerge.getChanges(oldDoc, doc);
   if (changes.length === 0) return null;
   const lastChange = changes[changes.length - 1];
-  await saveUnpushedChange(lastChange);
-  await saveSnapshot();
+  let persistError = null;
+  try {
+    await persistIncrement();
+  } catch (err) {
+    persistError = err;
+    console.error('Failed to persist local change, pushing anyway:', err.message);
+  }
   emitChange(lastChange);
+  if (persistError) _onPersistError?.(persistError);
   return lastChange;
 }
 

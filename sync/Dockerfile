@@ -9,6 +9,7 @@ RUN npm install
 ADD index.js db.js ws.js scheduler.js payments.js config.js /app/
 ADD routes/ /app/routes/
 ADD migrations/ /app/migrations/
+ADD scripts/ /app/scripts/
 
 EXPOSE 3000
 

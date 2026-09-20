@@ -60,6 +60,23 @@ Node.js/Express backend with PostgreSQL.
 | `standalone` | Single space, single user — default for self-hosting |
 | `multi` | Multiple spaces — set `PAYMENTS_ENABLED=true` to require Stripe payment per space |
 
+**Change log housekeeping**
+
+Clients push encrypted Automerge changes together with the change hash, and the server ignores duplicates. Pulls are paged (`?since=&limit=`), and a device that does not know the server state bootstraps from the space snapshot instead of the full log.
+
+| Env | Default | Description |
+|---|---|---|
+| `COMPACT_AFTER_DAYS` | `0` (off) | Daily job deleting changes already contained in a space's snapshot once they are older than this many days |
+| `PULL_PAGE_MAX` | `2000` | Upper bound for `limit` on paged pulls |
+
+Manual one-off compaction of a single space (dry run without `--yes`):
+
+```bash
+DATABASE_URL=postgresql://... node scripts/compact-space.js <spaceId> [--grace-days N] [--yes]
+```
+
+It refuses unless the latest snapshot was pushed by an up-to-date client (which reports the exact change cursor the snapshot contains). Clients whose cursor predates compacted history get `410 history_compacted` and re-bootstrap from the snapshot, so update all devices before compacting.
+
 ---
 
 ## landing

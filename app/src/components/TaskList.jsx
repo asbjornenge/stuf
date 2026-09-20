@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback, useImperativeHandle, forwardRef } from 'react';
 import styled from 'styled-components';
 import { AnimatePresence, motion } from 'framer-motion';
-import { initCRDT, needsMigration, getDocument, addTask, updateTask, deleteTask, updateTaskOrder, getGlobalTags, addGlobalTag, deleteGlobalTag, getRecentTags, updateRecentTags, getProjects, addProject, deleteProject, getSettings, updateSettings } from '../utils/crdt';
+import { initCRDT, needsMigration, getDocument, addTask, updateTask, deleteTask, updateTaskOrder, getGlobalTags, addGlobalTag, deleteGlobalTag, getRecentTags, updateRecentTags, getProjects, addProject, deleteProject, getSettings, updateSettings, setOnPersistError } from '../utils/crdt';
 import { initSync, teardownSync, isSyncing, getSyncConfig } from '../utils/sync';
 import { decryptChange } from '../utils/crypto';
 import { registerReminder, cancelReminder, subscribeToPush } from '../utils/push';
@@ -296,6 +296,9 @@ export default forwardRef(function TaskList(props, ref) {
 
       setMigrating(false);
       refreshFromDoc();
+      // Local storage failing is serious: changes are pushed to the server
+      // but will not survive a reload on this device until storage recovers.
+      setOnPersistError(() => showToast('Local storage failed. Your change was sent to sync, but reload to be safe.', 'error', 8000));
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, MIN_LOADING_MS - elapsed);
       setTimeout(() => setAppReady(true), remaining);

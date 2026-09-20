@@ -310,7 +310,7 @@ export default function Sync({ onConnect, onRemoteChanges }) {
             }}>Cancel Subscription</ActionButtonSecondary>
           )}
           <ActionButtonSecondary disabled={recoverState === 'loading'} onClick={async () => {
-            if (!window.confirm('Recover Sync re-uploads this device\'s entire local history and re-pulls everything from the server. Use if devices are out of sync. This may take up to a minute. Continue?')) return;
+            if (!window.confirm('Recover Sync fetches the server snapshot, merges it with this device\'s data and uploads anything the server is missing. Safe to run any time. Continue?')) return;
             setRecoverState('loading');
             setRecoverProgress(null);
             try {

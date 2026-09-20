@@ -1,6 +1,7 @@
 import { Router } from 'express';
-import { storeChanges, getChangesSince, getLastSeq, findDevice, getSpace, storeSnapshot, getSnapshot, getConfig, setConfig } from '../db.js';
+import { storeChanges, getChangesSince, getLastSeq, findDevice, getSpace, storeSnapshot, getSnapshot, getConfig, setConfig, getCompactedSeq } from '../db.js';
 import { notifyClients } from '../ws.js';
+import { PULL_PAGE_MAX } from '../config.js';
 
 const router = Router();
 
@@ -23,13 +24,19 @@ async function requireDevice(req, res, next) {
 
 router.use(requireDevice);
 
-// Push encrypted changes
+// Push encrypted changes.
+// Body: { changes: [ { data, hash } | string ], formatVersion }
+// Changes carrying a hash are de-duplicated; re-pushing is safe and cheap.
 router.post('/', async (req, res) => {
   const { changes, formatVersion } = req.body;
   const spaceId = req.device.space_id;
 
   if (!Array.isArray(changes) || changes.length === 0) {
     return res.status(400).json({ error: 'Missing or empty changes array' });
+  }
+  for (const c of changes) {
+    const ok = typeof c === 'string' || (c && typeof c.data === 'string');
+    if (!ok) return res.status(400).json({ error: 'Invalid change entry' });
   }
 
   // Check format version compatibility
@@ -38,22 +45,43 @@ router.post('/', async (req, res) => {
     return res.status(409).json({ error: 'format_version_mismatch', expected: parseInt(spaceFormat), got: formatVersion || null });
   }
 
-  const seqs = await storeChanges(spaceId, changes, req.device.id);
+  const { stored, duplicates } = await storeChanges(spaceId, changes, req.device.id);
   const lastSeq = await getLastSeq(spaceId);
 
-  notifyClients(req.device.id, spaceId, lastSeq, changes.length);
+  if (stored > 0) notifyClients(req.device.id, spaceId, lastSeq, stored);
 
-  res.json({ stored: changes.length, lastSeq });
+  res.json({ stored, duplicates, lastSeq });
 });
 
-// Pull changes since a sequence number
+// Pull changes since a sequence number.
+// Without `limit`: legacy behaviour, everything after `since`, lastSeq = global max.
+// With `limit`: one page; `lastSeq` is the cursor to continue from, `hasMore`
+// says whether to keep paging, `latestSeq` is the global max (informational).
+// 410 history_compacted: `since` predates deleted history — bootstrap from
+// the snapshot instead.
 router.get('/', async (req, res) => {
   const spaceId = req.device.space_id;
   const since = parseInt(req.query.since) || 0;
-  const changes = await getChangesSince(spaceId, since);
-  const lastSeq = await getLastSeq(spaceId);
 
-  res.json({ changes, lastSeq });
+  const compactedSeq = await getCompactedSeq(spaceId);
+  if (since < compactedSeq) {
+    return res.status(410).json({ error: 'history_compacted', compactedSeq });
+  }
+
+  const rawLimit = parseInt(req.query.limit);
+  if (!rawLimit || rawLimit < 1) {
+    const changes = await getChangesSince(spaceId, since);
+    const lastSeq = await getLastSeq(spaceId);
+    return res.json({ changes, lastSeq });
+  }
+
+  const limit = Math.min(rawLimit, PULL_PAGE_MAX);
+  const rows = await getChangesSince(spaceId, since, limit + 1);
+  const hasMore = rows.length > limit;
+  const changes = hasMore ? rows.slice(0, limit) : rows;
+  const cursor = changes.length > 0 ? changes[changes.length - 1].seq : since;
+  const latestSeq = await getLastSeq(spaceId);
+  res.json({ changes, lastSeq: cursor, hasMore, latestSeq });
 });
 
 // Set format version for the space (idempotent, never downgrades)
@@ -71,19 +99,22 @@ router.post('/format-version', async (req, res) => {
   res.json({ ok: true, formatVersion: version });
 });
 
-// Store a document snapshot (encrypted)
+// Store a document snapshot (encrypted).
+// Body: { snapshot, seq } where `seq` is the cursor the device had fully
+// applied when the snapshot was taken (omitted by legacy clients).
 router.post('/snapshot', async (req, res) => {
   const spaceId = req.device.space_id;
-  const { snapshot } = req.body;
+  const { snapshot, seq } = req.body;
   if (!snapshot) {
     return res.status(400).json({ error: 'Missing snapshot' });
   }
-  await storeSnapshot(spaceId, snapshot, req.device.id);
+  await storeSnapshot(spaceId, snapshot, req.device.id, Number.isInteger(seq) ? seq : undefined);
   const lastSeq = await getLastSeq(spaceId);
   res.json({ ok: true, seq: lastSeq });
 });
 
-// Get the latest snapshot
+// Get the latest snapshot: { data, seq }. Changes with seq > `seq` must be
+// pulled on top of it.
 router.get('/snapshot', async (req, res) => {
   const result = await getSnapshot(req.device.space_id);
   if (!result) {

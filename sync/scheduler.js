@@ -1,9 +1,38 @@
 import * as Sentry from '@sentry/node';
 import webpush from 'web-push';
-import { VAPID_CONTACT } from './config.js';
-import { getDueReminders, markReminderSent, getPushSubscriptionsForSpace, deletePushSubscription, getServerConfig } from './db.js';
+import { VAPID_CONTACT, COMPACT_AFTER_DAYS } from './config.js';
+import { getDueReminders, markReminderSent, getPushSubscriptionsForSpace, deletePushSubscription, getServerConfig, getSpacesWithSnapshot, compactChanges } from './db.js';
+
+// Compaction: once a day, delete changes that are already contained in a
+// space's snapshot and older than COMPACT_AFTER_DAYS. Off unless configured.
+export async function runCompaction() {
+  const grace = COMPACT_AFTER_DAYS * 24 * 60 * 60;
+  const spaces = await getSpacesWithSnapshot();
+  for (const spaceId of spaces) {
+    try {
+      const result = await compactChanges(spaceId, grace);
+      if (result && result.deleted > 0) {
+        console.log(`Compaction: space ${spaceId} deleted ${result.deleted} changes (<= seq ${result.compactedSeq})`);
+      }
+    } catch (err) {
+      console.warn('Compaction failed for space', spaceId, err.message);
+      Sentry.captureException(err, { tags: { context: 'compaction', spaceId } });
+    }
+  }
+}
+
+function startCompaction() {
+  if (!COMPACT_AFTER_DAYS) {
+    console.log('Compaction disabled (COMPACT_AFTER_DAYS=0)');
+    return;
+  }
+  setInterval(() => runCompaction().catch(err => console.warn('Compaction run failed:', err.message)), 24 * 60 * 60 * 1000);
+  setTimeout(() => runCompaction().catch(err => console.warn('Compaction run failed:', err.message)), 60 * 1000);
+  console.log(`Compaction enabled (changes older than ${COMPACT_AFTER_DAYS} days already in snapshot)`);
+}
 
 export async function startScheduler() {
+  startCompaction();
   const vapidPublic = await getServerConfig('vapid_public_key');
   const vapidPrivate = await getServerConfig('vapid_private_key');
 

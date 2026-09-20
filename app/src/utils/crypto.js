@@ -23,8 +23,8 @@ async function storeRawKey(rawKey) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     tx.objectStore(STORE_NAME).put(rawKey, KEY_ID);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
   });
 }
 
@@ -33,8 +33,8 @@ async function loadRawKey() {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const req = tx.objectStore(STORE_NAME).get(KEY_ID);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
+    req.onerror = () => { db.close(); reject(req.error); };
   });
 }
 
@@ -140,7 +140,7 @@ export async function encryptChange(change) {
 }
 
 /**
- * Decrypt a base64 string → Array (for Automerge consumption).
+ * Decrypt a base64 string → Uint8Array (for Automerge consumption).
  */
 export async function decryptChange(base64) {
   const key = await getEncryptionKey();
@@ -155,5 +155,5 @@ export async function decryptChange(base64) {
     ciphertext
   );
 
-  return Array.from(new Uint8Array(decrypted));
+  return new Uint8Array(decrypted);
 }

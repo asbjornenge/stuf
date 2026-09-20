@@ -28,20 +28,30 @@ function headers() {
   };
 }
 
+const PULL_PAGE = 500;
+
+// Pull everything after our cursor, one page at a time. If the server has
+// compacted history past our cursor (410), start over from the snapshot.
 export async function pullChanges() {
-  const res = await fetch(`${serverUrl}/api/changes?since=${lastSeq}`, { headers: headers() });
-  if (!res.ok) throw new Error(`Pull failed: ${res.status} ${await res.text()}`);
-  const { changes, lastSeq: newSeq } = await res.json();
-  for (const { data } of changes) {
-    try {
-      const change = await decrypt(data);
-      [doc] = Automerge.applyChanges(doc, [change]);
-    } catch (err) {
-      console.warn(`Failed to apply change: ${err.message}`);
+  for (;;) {
+    const res = await fetch(`${serverUrl}/api/changes?since=${lastSeq}&limit=${PULL_PAGE}`, { headers: headers() });
+    if (res.status === 410) {
+      lastSeq = 0;
+      return initialize();
     }
+    if (!res.ok) throw new Error(`Pull failed: ${res.status} ${await res.text()}`);
+    const { changes, lastSeq: cursor, hasMore } = await res.json();
+    for (const { data } of changes) {
+      try {
+        const change = await decrypt(data);
+        [doc] = Automerge.applyChanges(doc, [change]);
+      } catch (err) {
+        console.warn(`Failed to apply change: ${err.message}`);
+      }
+    }
+    if (cursor !== undefined) lastSeq = cursor;
+    if (!hasMore) return doc;
   }
-  if (newSeq !== undefined) lastSeq = newSeq;
-  return doc;
 }
 
 export async function pullSnapshot() {
@@ -62,11 +72,16 @@ export async function pullSnapshot() {
 export async function pushChanges(oldDoc, newDoc) {
   const changes = Automerge.getChanges(oldDoc, newDoc);
   if (changes.length === 0) return;
-  const encrypted = await Promise.all(changes.map(c => encrypt(Array.from(c))));
+  // Each change carries its Automerge hash (plaintext) so the server can
+  // de-duplicate; re-sending a change is always safe.
+  const entries = await Promise.all(changes.map(async c => ({
+    data: await encrypt(Array.from(c)),
+    hash: Automerge.decodeChange(c).hash,
+  })));
   const res = await fetch(`${serverUrl}/api/changes`, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify({ changes: encrypted, formatVersion: 3 })
+    body: JSON.stringify({ changes: entries, formatVersion: 3 })
   });
   if (!res.ok) throw new Error(`Push failed: ${res.status} ${await res.text()}`);
   const { lastSeq: newSeq } = await res.json();

@@ -216,11 +216,19 @@ export async function addDevice(spaceId, tokenHash) {
 
 // --- Snapshot ---
 
-export async function storeSnapshot(spaceId, data, deviceId) {
+// `seq` is the change cursor the pushing device had fully pulled and applied
+// when it produced the snapshot. Everything with seq <= snapshot_seq is
+// therefore contained in the snapshot, which is what makes compaction safe.
+// Legacy clients omit it; we then fall back to the current last seq and mark
+// the snapshot as not compaction-safe.
+export async function storeSnapshot(spaceId, data, deviceId, seq) {
   const lastSeq = await getLastSeq(spaceId);
+  const exact = Number.isInteger(seq) && seq >= 0 && seq <= lastSeq;
   await setConfig(spaceId, 'snapshot', data);
-  await setConfig(spaceId, 'snapshot_seq', String(lastSeq));
+  await setConfig(spaceId, 'snapshot_seq', String(exact ? seq : lastSeq));
+  await setConfig(spaceId, 'snapshot_exact', exact ? '1' : '0');
   await setConfig(spaceId, 'snapshot_device', String(deviceId));
+  await setConfig(spaceId, 'snapshot_at', String(Math.floor(Date.now() / 1000)));
 }
 
 export async function getSnapshot(spaceId) {
@@ -230,31 +238,75 @@ export async function getSnapshot(spaceId) {
   return data ? { data, seq } : null;
 }
 
-// --- Changes ---
-
-export async function storeChanges(spaceId, changes, deviceId) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const seqs = [];
-    for (const data of changes) {
-      const { rows } = await client.query(
-        'INSERT INTO changes (space_id, data, device_id) VALUES ($1, $2, $3) RETURNING seq',
-        [spaceId, data, deviceId]
-      );
-      seqs.push(rows[0].seq);
-    }
-    await client.query('COMMIT');
-    return seqs;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+// Seq up to which old changes have been deleted (0 = never compacted).
+export async function getCompactedSeq(spaceId) {
+  return parseInt(await getConfig(spaceId, 'compacted_seq')) || 0;
 }
 
-export async function getChangesSince(spaceId, since) {
+// Delete changes already contained in the space's snapshot and older than
+// `graceSeconds`. Only runs against snapshots that carry an exact seq.
+// Returns { deleted, compactedSeq } or null if nothing could be done.
+export async function compactChanges(spaceId, graceSeconds) {
+  const exact = await getConfig(spaceId, 'snapshot_exact');
+  const snapshotSeq = parseInt(await getConfig(spaceId, 'snapshot_seq')) || 0;
+  if (exact !== '1' || snapshotSeq === 0) return null;
+  const cutoff = Math.floor(Date.now() / 1000) - graceSeconds;
+  const { rows } = await pool.query(
+    'DELETE FROM changes WHERE space_id = $1 AND seq <= $2 AND created_at <= $3 RETURNING seq',
+    [spaceId, snapshotSeq, cutoff]
+  );
+  if (rows.length === 0) return { deleted: 0, compactedSeq: await getCompactedSeq(spaceId) };
+  const maxDeleted = Math.max(...rows.map(r => r.seq));
+  const compactedSeq = Math.max(maxDeleted, await getCompactedSeq(spaceId));
+  await setConfig(spaceId, 'compacted_seq', String(compactedSeq));
+  return { deleted: rows.length, compactedSeq };
+}
+
+export async function getSpacesWithSnapshot() {
+  const { rows } = await pool.query(
+    "SELECT DISTINCT space_id FROM config WHERE key = 'snapshot'"
+  );
+  return rows.map(r => r.space_id);
+}
+
+// --- Changes ---
+
+// `changes` is an array of either strings (legacy: ciphertext only) or
+// { data, hash } objects. Rows with a hash are de-duplicated per space; a
+// duplicate is silently skipped. Single statement, so the batch is atomic and
+// insertion (seq) order follows array order.
+export async function storeChanges(spaceId, changes, deviceId) {
+  const datas = [];
+  const hashes = [];
+  for (const c of changes) {
+    if (typeof c === 'string') {
+      datas.push(c);
+      hashes.push(null);
+    } else {
+      datas.push(c.data);
+      hashes.push(typeof c.hash === 'string' && c.hash.length > 0 ? c.hash : null);
+    }
+  }
+  const { rowCount } = await pool.query(
+    `INSERT INTO changes (space_id, data, device_id, hash)
+     SELECT $1, t.d, $2, t.h
+     FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS t(d, h, ord)
+     ORDER BY t.ord
+     ON CONFLICT (space_id, hash) WHERE hash IS NOT NULL DO NOTHING`,
+    [spaceId, deviceId, datas, hashes]
+  );
+  return { stored: rowCount, duplicates: changes.length - rowCount };
+}
+
+// Without `limit` returns everything after `since` (legacy clients).
+export async function getChangesSince(spaceId, since, limit) {
+  if (limit) {
+    const { rows } = await pool.query(
+      'SELECT seq, data FROM changes WHERE space_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3',
+      [spaceId, since, limit]
+    );
+    return rows;
+  }
   const { rows } = await pool.query(
     'SELECT seq, data FROM changes WHERE space_id = $1 AND seq > $2 ORDER BY seq ASC',
     [spaceId, since]
