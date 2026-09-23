@@ -72,7 +72,7 @@ export default function Sync({ onConnect, onRemoteChanges }) {
 
   useEffect(() => {
     if (synced && view === 'main') {
-      getSpaceInfo().then(setSpaceInfo).catch(e => console.warn('space-info:', e));
+      getSpaceInfo().then(setSpaceInfo).catch(e => setError(e.message));
     }
   }, [synced, view]);
 
@@ -225,7 +225,7 @@ export default function Sync({ onConnect, onRemoteChanges }) {
     const config = getSyncConfig();
     return (
       <Container>
-        <Status>Syncing</Status>
+        <Status>Sync configured</Status>
         <ServerUrl>{config?.serverUrl}</ServerUrl>
         {spaceInfo && (
           <SpaceInfoSection>
@@ -285,7 +285,14 @@ export default function Sync({ onConnect, onRemoteChanges }) {
             ))}
           </SpaceInfoSection>
         )}
-        {error && <ErrorText>{error}</ErrorText>}
+        {error && <ErrorText>
+          {error}
+          {/failed to fetch|load failed|networkerror/i.test(error) && <>
+            {' '}Check your connection. For a local sync server, also check that
+            this site is allowed Local Network Access in your browser's site settings,
+            then reload and try Recover Sync.
+          </>}
+        </ErrorText>}
         <Actions>
           {pushStatus === 'default' && (
             <ActionButton onClick={handleEnableNotifications}>Enable Notifications</ActionButton>
@@ -313,6 +320,7 @@ export default function Sync({ onConnect, onRemoteChanges }) {
           )}
           <ActionButtonSecondary disabled={recoverState === 'loading'} onClick={async () => {
             if (!window.confirm('Recover Sync fetches the server snapshot, merges it with this device\'s data and uploads anything the server is missing. Safe to run any time. Continue?')) return;
+            setError('');
             setRecoverState('loading');
             setRecoverProgress(null);
             try {
@@ -489,7 +497,7 @@ const Container = styled.div`
 `;
 
 const Status = styled.div`
-  color: #4cd964;
+  color: inherit;
   font-size: 1rem;
   font-weight: 600;
   margin-bottom: 0.25rem;
